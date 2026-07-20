@@ -22,7 +22,11 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$Script:ToolVersion = '0.3.0'
+# Decode native tool output (rclone paths etc.) as UTF-8; without this,
+# non-ASCII world names get mangled on CJK-codepage consoles.
+try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
+
+$Script:ToolVersion = '0.3.1'
 $Script:ToolDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Script:StateFile = Join-Path $Script:ToolDir 'state.json'
 $Script:BackupRoot = Join-Path $Script:ToolDir 'backups'
