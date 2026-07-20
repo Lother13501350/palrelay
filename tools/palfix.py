@@ -225,6 +225,43 @@ def cmd_check(args):
     emit(out)
 
 
+def cmd_players(args):
+    # Deep identity diagnostic: every player character entry in Level.sav
+    # (uid, instance, nickname, level) plus what each Players/*.sav claims.
+    level_path = os.path.join(args.dir, "Level.sav")
+    if not os.path.exists(level_path):
+        fail("Level.sav not found")
+    level_json, _ = load_json(level_path)
+    wsd = wsd_of(level_json)
+    entries = []
+    for entry in wsd.get("CharacterSaveParameterMap", {}).get("value", []):
+        if not is_player_entry(entry):
+            continue
+        sp = save_parameter(entry)
+        entries.append({
+            "uid": str(entry["key"]["PlayerUId"]["value"]).lower(),
+            "instance": str(entry["key"]["InstanceId"]["value"]).lower(),
+            "nickname": sp.get("NickName", {}).get("value"),
+            "level": sp.get("Level", {}).get("value"),
+        })
+    files = []
+    pdir = os.path.join(args.dir, "Players")
+    if os.path.isdir(pdir):
+        for f in sorted(os.listdir(pdir)):
+            if not f.lower().endswith(".sav"):
+                continue
+            try:
+                pj, _ = load_json(os.path.join(pdir, f))
+                sd = pj["properties"]["SaveData"]["value"]
+                rec = {"file": f, "playerUId": str(sd.get("PlayerUId", {}).get("value", "")).lower()}
+                if "IndividualId" in sd:
+                    rec["instance"] = str(sd["IndividualId"]["value"]["InstanceId"]["value"]).lower()
+                files.append(rec)
+            except Exception as e:
+                files.append({"file": f, "error": f"{type(e).__name__}: {e}"})
+    emit({"ok": True, "mapEntries": entries, "playerFiles": files})
+
+
 def cmd_fix(args):
     world_dir = args.dir
     old_d = dashed(args.old_guid)
@@ -382,6 +419,164 @@ def cmd_fix(args):
     emit(out)
 
 
+def _collect_container_ids(sd, prefix=""):
+    # Walk SaveData for *ContainerId fields -> {field-path: guid-string}
+    found = {}
+    if not isinstance(sd, dict):
+        return found
+    for k, v in sd.items():
+        path = f"{prefix}/{k}"
+        if isinstance(v, dict):
+            if k.endswith("ContainerId"):
+                inner = v.get("value", {})
+                gid = None
+                if isinstance(inner, dict):
+                    idf = inner.get("ID")
+                    if isinstance(idf, dict) and "value" in idf:
+                        gid = str(idf["value"]).lower()
+                    elif "value" in inner:
+                        gid = str(inner["value"]).lower()
+                if gid:
+                    found[path] = gid
+                    continue
+            found.update(_collect_container_ids(v, path))
+    return found
+
+
+def _entry_key_id(entry):
+    key = entry.get("key")
+    if not isinstance(key, dict):
+        return None
+    idf = key.get("ID")
+    if isinstance(idf, dict) and "value" in idf:
+        return str(idf["value"]).lower()
+    if "value" in key:
+        return str(key["value"]).lower()
+    return None
+
+
+def _set_entry_key_id(entry, new_id):
+    key = entry["key"]
+    if isinstance(key.get("ID"), dict) and "value" in key["ID"]:
+        key["ID"]["value"] = new_id
+    else:
+        key["value"] = new_id
+
+
+def cmd_rebind(args):
+    """Re-point the migrated character onto the server-created identity.
+
+    Never rewrites any Players/*.sav (the server rejected our rewritten player
+    file and spawned a fresh character); instead, Level.sav-only surgery:
+      - the migrated character entry takes over the fresh entry's InstanceId
+      - the fresh (empty) character entry is removed
+      - the old character's item/pal containers are re-keyed onto the ids the
+        server-native player file references, so inventory and party survive
+      - guild blob instance references are updated at byte level
+    """
+    uid = dashed(args.uid)
+    uid_hex = uid.replace("-", "").upper()
+    level_path = os.path.join(args.dir, "Level.sav")
+    cur_player_path = os.path.join(args.dir, "Players", uid_hex + ".sav")
+    for p, m in ((level_path, "Level.sav not found"),
+                 (cur_player_path, f"Players/{uid_hex}.sav not found"),
+                 (args.old_player, "old player sav not found")):
+        if not os.path.exists(p):
+            fail(m)
+
+    level_json, _ = load_json(level_path)
+    old_pj, _ = load_json(args.old_player)
+    cur_pj, _ = load_json(cur_player_path)
+    wsd = wsd_of(level_json)
+
+    old_sd = old_pj["properties"]["SaveData"]["value"]
+    cur_sd = cur_pj["properties"]["SaveData"]["value"]
+    old_inst = str(old_sd["IndividualId"]["value"]["InstanceId"]["value"]).lower()
+    cur_inst = str(cur_sd["IndividualId"]["value"]["InstanceId"]["value"]).lower()
+    if old_inst == cur_inst:
+        fail("old and current instance are identical - nothing to rebind")
+
+    # --- character map: fresh entry out, migrated entry takes its instance ---
+    char_map = wsd["CharacterSaveParameterMap"]["value"]
+    fresh_i = mig_i = None
+    for i, e in enumerate(char_map):
+        inst = str(e["key"]["InstanceId"]["value"]).lower()
+        if inst == cur_inst:
+            fresh_i = i
+        elif inst == old_inst:
+            mig_i = i
+    if mig_i is None:
+        fail(f"migrated character entry (instance {old_inst}) not found")
+    if fresh_i is not None:
+        del char_map[fresh_i]
+        if fresh_i < mig_i:
+            mig_i -= 1
+    char_map[mig_i]["key"]["PlayerUId"]["value"] = uid
+    char_map[mig_i]["key"]["InstanceId"]["value"] = cur_inst
+
+    # --- container re-keying: old character's containers onto current ids ----
+    old_ids = _collect_container_ids(old_sd)
+    cur_ids = _collect_container_ids(cur_sd)
+    pairs = []
+    for path, gid in old_ids.items():
+        if path in cur_ids and cur_ids[path] != gid:
+            pairs.append((gid, cur_ids[path]))
+    rekeyed = {"item": 0, "character": 0, "dropped": 0}
+    for section, tag in (("ItemContainerSaveData", "item"), ("CharacterContainerSaveData", "character")):
+        entries = wsd.get(section, {}).get("value", [])
+        for old_id, new_id in pairs:
+            fresh_j = old_j = None
+            for j, e in enumerate(entries):
+                kid = _entry_key_id(e)
+                if kid == new_id:
+                    fresh_j = j
+                elif kid == old_id:
+                    old_j = j
+            if old_j is None:
+                continue
+            if fresh_j is not None:
+                del entries[fresh_j]
+                rekeyed["dropped"] += 1
+                if fresh_j < old_j:
+                    old_j -= 1
+            _set_entry_key_id(entries[old_j], new_id)
+            rekeyed[tag] += 1
+
+    # --- guild blobs: old instance bytes -> current instance bytes -----------
+    old_b = guid_bytes(old_inst)
+    cur_b = guid_bytes(cur_inst)
+    guild_bytes_replaced = 0
+    for group in wsd.get("GroupSaveDataMap", {}).get("value", []):
+        raw = group["value"].get("RawData", {}).get("value")
+        if isinstance(raw, dict):
+            if "values" in raw and isinstance(raw["values"], list):
+                blob = bytes(raw["values"])
+                if old_b in blob:
+                    guild_bytes_replaced += blob.count(old_b)
+                    raw["values"] = list(blob.replace(old_b, cur_b))
+            handles = raw.get("individual_character_handle_ids")
+            if isinstance(handles, list):
+                for h in handles:
+                    if str(h.get("instance_id", "")).lower() == old_inst:
+                        h["instance_id"] = cur_inst
+                        h["guid"] = uid
+
+    import shutil
+    shutil.copy2(level_path, level_path + ".rebind-bak")
+    write_json(level_json, level_path)
+    emit({
+        "ok": True,
+        "uid": uid,
+        "oldInstance": old_inst,
+        "newInstance": cur_inst,
+        "containerPairs": len(pairs),
+        "itemContainersRekeyed": rekeyed["item"],
+        "characterContainersRekeyed": rekeyed["character"],
+        "freshContainersDropped": rekeyed["dropped"],
+        "guildBytesReplaced": guild_bytes_replaced,
+    })
+
+
 def main():
     ap = argparse.ArgumentParser(prog="palfix")
     ap.add_argument("--ooz-dll", default=None)
@@ -394,10 +589,18 @@ def main():
     p_check.add_argument("--dir", required=True)
     p_check.add_argument("--write-test", action="store_true")
 
+    p_players = sub.add_parser("players")
+    p_players.add_argument("--dir", required=True)
+
     p_fix = sub.add_parser("fix")
     p_fix.add_argument("--dir", required=True)
     p_fix.add_argument("--new-guid", required=True)
     p_fix.add_argument("--old-guid", default=DEFAULT_OLD)
+
+    p_rebind = sub.add_parser("rebind")
+    p_rebind.add_argument("--dir", required=True)
+    p_rebind.add_argument("--uid", required=True)
+    p_rebind.add_argument("--old-player", required=True)
 
     args = ap.parse_args()
     setup_ooz(args.ooz_dll)
@@ -407,8 +610,12 @@ def main():
             cmd_meta(args)
         elif args.cmd == "check":
             cmd_check(args)
+        elif args.cmd == "players":
+            cmd_players(args)
         elif args.cmd == "fix":
             cmd_fix(args)
+        elif args.cmd == "rebind":
+            cmd_rebind(args)
     except SystemExit:
         raise
     except Exception as e:
