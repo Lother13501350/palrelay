@@ -307,6 +307,24 @@ Exit codes:`0` 成功 / `1` 一般錯誤 / `2` 鎖被他人持有 / `3` 設定�
 用社群工具(PalworldSaveTools 或 Physgun 網頁版轉換器)完成,之後由該成員執行
 `palrelay.ps1 upload` 播種為 v1。此後永遠不再需要動存檔內部。
 
+## 12.5 既有 co-op 世界匯入(v0.3)
+
+2026 夏季更新後存檔為 PlM(Oodle)格式,由 `tools/palfix.py`(CI 以 PyInstaller
+打包為 `palfix.exe`)處理:
+
+- **解析**:palworld-save-tools 0.24.0 + quadrantbs/palworld-hostfix-toolkit
+  的 patch(pin commit `306dd72`,MIT);PlM 解壓靠 libooz.dll(zao/ooz,
+  上游無授權條款,故**不隨包散佈**,使用時經同意後下載並驗 SHA-256)
+- **寫回**:一律 zlib(PlZ)——遊戲仍接受舊壓縮格式,免實作 Oodle 壓縮
+- **`import` 指令**:掃描 `%LOCALAPPDATA%\Pal` 的 co-op 世界(以 LevelMeta
+  解出世界名)→ 複製進伺服器(原檔不動)→ 刪 WorldOption.sav(讓 ini 生效)
+  → 播種為雲端新世界 v1,並記錄既有玩家檔清單(state 的 `importPlayers`)
+- **`fixhost` 指令**:原主機第一次加入伺服器建立新角色後執行——palfix 做
+  完整四層搬遷(角色合併/帕魯 key 歸零與 Owner 修正/公會 blob 位元組修補/
+  容器欄位),依 `importPlayers` 自動辨識新角色檔,成功才上傳新版並釋放鎖;
+  失敗則雲端不動、本機標記重新下載
+- 訪客玩家的角色 GUID 在 co-op 與 dedicated 相同,毋須處理
+
 ## 13. 測試策略
 
 - `test/fake-rclone.ps1`:模擬 rclone 的 `cat` / `copyto` / `deletefile` / `lsjson`
