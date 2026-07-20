@@ -56,6 +56,20 @@ switch ($cmd) {
         Copy-Item -Path $src -Destination $dst -Force
         exit 0
     }
+    'moveto' {
+        $src = Resolve-FakePath $args[1]
+        $dst = Resolve-FakePath $args[2]
+        if (-not (Test-Path $src)) {
+            [Console]::Error.WriteLine("fake-rclone: source not found: $($args[1])")
+            exit 3
+        }
+        $dir = Split-Path -Parent $dst
+        if ($dir -and -not (Test-Path $dir)) {
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        }
+        Move-Item -Path $src -Destination $dst -Force
+        exit 0
+    }
     'deletefile' {
         $p = Resolve-FakePath $args[1]
         if (Test-Path $p -PathType Leaf) { Remove-Item -Path $p -Force }

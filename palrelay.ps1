@@ -2,25 +2,36 @@
 # Cloud backend: any rclone remote (designed for Google Drive shared folder).
 # Spec: docs/DESIGN.md
 #
+# Cloud layout (schema v2):
+#   group.json                     shared group settings (adminPassword, ...)
+#   worlds/<name>/lock.json        advisory lock while someone hosts <name>
+#   worlds/<name>/latest.json      pointer to the newest save zip
+#   worlds/<name>/saves/*.zip      versioned save archives
+#
 # Requires: Windows PowerShell 5.1+, rclone. Keep this file ASCII-only (PS 5.1
 # misreads UTF-8-without-BOM sources that contain non-ASCII characters).
 
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('start', 'status', 'upload', 'takeover', 'init', 'help')]
+    [ValidateSet('start', 'status', 'upload', 'takeover', 'worlds', 'init', 'help')]
     [string]$Command = 'help',
+    [Parameter(Position = 1)]
+    [string]$World = '',
     [switch]$Force
 )
 
 $ErrorActionPreference = 'Stop'
 
-$Script:ToolVersion = '0.1.2'
+$Script:ToolVersion = '0.2.0'
 $Script:ToolDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Script:StateFile = Join-Path $Script:ToolDir 'state.json'
 $Script:BackupRoot = Join-Path $Script:ToolDir 'backups'
 $Script:Config = $null
 $Script:CurrentLock = $null
 $Script:SessionVersion = 0
+$Script:WorldName = ''
+$Script:GroupConfig = $null
+$Script:GroupConfigLoaded = $false
 
 # ---------------------------------------------------------------- output ----
 
@@ -60,7 +71,7 @@ function Set-DefaultProp($Obj, [string]$Name, $Value) {
 function Read-Config {
     $path = Join-Path $Script:ToolDir 'config.json'
     if (-not (Test-Path $path)) {
-        throw "config.json not found. Run '.\palrelay.ps1 init' and edit the file."
+        throw "config.json not found. Run setup.cmd (friends) or '.\palrelay.ps1 init' and edit the file."
     }
     # Explicit UTF-8: PS 5.1 Get-Content decodes BOM-less files as ANSI, which
     # mangles non-ASCII paths (e.g. a Desktop folder with CJK characters).
@@ -72,6 +83,7 @@ function Read-Config {
     Set-DefaultProp $cfg 'rclonePath' 'rclone'
     Set-DefaultProp $cfg 'rcloneConfig' ''
     Set-DefaultProp $cfg 'serverExe' 'PalServer.exe'
+    Set-DefaultProp $cfg 'serverPort' 8211
     Set-DefaultProp $cfg 'restPort' 8212
     Set-DefaultProp $cfg 'heartbeatMinutes' 5
     Set-DefaultProp $cfg 'staleMinutes' 20
@@ -90,15 +102,40 @@ function Read-Config {
     return $cfg
 }
 
-function Read-State {
+function Read-StateFile {
+    $s = $null
     if (Test-Path $Script:StateFile) {
-        return [IO.File]::ReadAllText($Script:StateFile, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        $s = [IO.File]::ReadAllText($Script:StateFile, [Text.Encoding]::UTF8) | ConvertFrom-Json
     }
+    if ($null -eq $s) {
+        return [pscustomobject]@{ schemaVersion = 2; lastWorld = ''; worlds = [pscustomobject]@{} }
+    }
+    if ($null -eq $s.PSObject.Properties['schemaVersion']) {
+        # v1 flat state -> v2 per-world (the flat world becomes 'main')
+        $entry = [pscustomobject]@{
+            phase = [string]$s.phase
+            lastDownloadedVersion = [int]$s.lastDownloadedVersion
+            hostingStartedUtc = [string]$s.hostingStartedUtc
+        }
+        $worlds = [pscustomobject]@{}
+        $worlds | Add-Member -NotePropertyName 'main' -NotePropertyValue $entry
+        return [pscustomobject]@{ schemaVersion = 2; lastWorld = 'main'; worlds = $worlds }
+    }
+    return $s
+}
+
+function Read-WorldState {
+    $s = Read-StateFile
+    $p = $s.worlds.PSObject.Properties[$Script:WorldName]
+    if ($p -and $p.Value) { return $p.Value }
     return [pscustomobject]@{ phase = 'idle'; lastDownloadedVersion = 0; hostingStartedUtc = '' }
 }
 
-function Write-State($State) {
-    [IO.File]::WriteAllText($Script:StateFile, ($State | ConvertTo-Json -Depth 5))
+function Write-WorldState($Entry) {
+    $s = Read-StateFile
+    $s.lastWorld = $Script:WorldName
+    $s.worlds | Add-Member -NotePropertyName $Script:WorldName -NotePropertyValue $Entry -Force
+    [IO.File]::WriteAllText($Script:StateFile, ($s | ConvertTo-Json -Depth 8))
 }
 
 # ---------------------------------------------------------------- rclone ----
@@ -152,6 +189,10 @@ function Get-RemotePath([string]$Name) {
     return ($Script:Config.remote + '/' + $Name)
 }
 
+function Get-WorldPath([string]$Name) {
+    return ($Script:Config.remote + '/worlds/' + $Script:WorldName + '/' + $Name)
+}
+
 function ConvertFrom-JsonArray([string]$Text) {
     # PS 5.1 emits a parsed JSON array as ONE pipeline object, and @(cmd) then
     # wraps it into a single-element array. Normalize to a real element array.
@@ -175,9 +216,87 @@ function Put-RemoteJson([string]$RemotePath, $Object) {
     finally { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
 }
 
+# ------------------------------------------------------- group and worlds ---
+
+function Get-GroupConfig {
+    if (-not $Script:GroupConfigLoaded) {
+        $Script:GroupConfig = Get-RemoteJson (Get-RemotePath 'group.json')
+        $Script:GroupConfigLoaded = $true
+    }
+    return $Script:GroupConfig
+}
+
+function Get-AdminPassword {
+    $g = Get-GroupConfig
+    if ($g -and $g.adminPassword) { return [string]$g.adminPassword }
+    if ($Script:Config.adminPassword) { return [string]$Script:Config.adminPassword }
+    return ''
+}
+
+function Ensure-CloudLayout {
+    # One-time migration of the v1 flat layout (lock/latest/saves at the root)
+    # into worlds/main/, plus group.json bootstrap.
+    $legacyLatest = Get-RemoteJson (Get-RemotePath 'latest.json')
+    if ($legacyLatest) {
+        $legacyLock = Get-RemoteJson (Get-RemotePath 'lock.json')
+        if ($legacyLock -and -not (Test-LockStale $legacyLock)) {
+            throw ('Cloud migration pending, but {0} is hosting the legacy world right now. Try again later.' -f $legacyLock.holder)
+        }
+        Write-Info 'Migrating cloud layout v1 -> v2 (moving world into worlds/main)...'
+        Invoke-Rclone @('moveto', (Get-RemotePath 'latest.json'), (Get-RemotePath 'worlds/main/latest.json')) | Out-Null
+        Invoke-Rclone @('moveto', (Get-RemotePath 'saves'), (Get-RemotePath 'worlds/main/saves')) | Out-Null
+        if ($legacyLock) {
+            Invoke-Rclone @('deletefile', (Get-RemotePath 'lock.json')) -AllowFail | Out-Null
+        }
+        Write-Info 'Cloud migration complete.'
+    }
+    if ($null -eq (Get-GroupConfig) -and $Script:Config.adminPassword) {
+        Put-RemoteJson (Get-RemotePath 'group.json') ([pscustomobject]@{
+            schemaVersion = 2
+            adminPassword = $Script:Config.adminPassword
+            createdBy     = $Script:Config.playerName
+            createdUtc    = (Now-Iso)
+        })
+        $Script:GroupConfigLoaded = $false
+        Write-Info 'group.json created on the shared folder (adminPassword now shared with the group).'
+    }
+}
+
+function Get-CloudWorlds {
+    $text = Invoke-RcloneText @('lsjson', (Get-RemotePath 'worlds'))
+    $items = ConvertFrom-JsonArray $text
+    return ,@($items | Where-Object { $_.IsDir } | ForEach-Object { [string]$_.Name })
+}
+
+function Resolve-WorldName([string]$Requested) {
+    if ($Requested) {
+        if ($Requested -match '[\\/:*?"<>|]') { throw 'World names must not contain \ / : * ? " < > |' }
+        return $Requested
+    }
+    $s = Read-StateFile
+    if ($s.lastWorld) { return [string]$s.lastWorld }
+    $worlds = Get-CloudWorlds
+    if ($worlds.Count -eq 1) { return $worlds[0] }
+    if ($worlds.Count -eq 0) { return 'main' }
+    throw ('Several worlds exist ({0}). Pick one: .\palrelay.ps1 start <world>' -f ($worlds -join ', '))
+}
+
 # ------------------------------------------------------------------ lock ----
 
-function Get-RemoteLock { return Get-RemoteJson (Get-RemotePath 'lock.json') }
+function Get-HostIp {
+    # Tailscale IP lets friends connect without port forwarding; best effort.
+    try {
+        $prev = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        $ip = & tailscale ip -4 2>$null | Select-Object -First 1
+        $code = $LASTEXITCODE
+        $ErrorActionPreference = $prev
+        if ($code -eq 0 -and $ip) { return ([string]$ip).Trim() }
+    } catch {}
+    return ''
+}
+
+function Get-RemoteLock { return Get-RemoteJson (Get-WorldPath 'lock.json') }
 
 function Test-LockOurs($Lock) {
     return ($Lock.holder -eq $Script:Config.playerName -and $Lock.machine -eq $env:COMPUTERNAME)
@@ -207,9 +326,11 @@ function Acquire-Lock {
         nonce        = [guid]::NewGuid().ToString()
         startedUtc   = (Now-Iso)
         heartbeatUtc = (Now-Iso)
+        hostIp       = (Get-HostIp)
+        serverPort   = [int]$Script:Config.serverPort
         toolVersion  = $Script:ToolVersion
     }
-    Put-RemoteJson (Get-RemotePath 'lock.json') $lock
+    Put-RemoteJson (Get-WorldPath 'lock.json') $lock
     Start-Sleep -Seconds 3
     $check = Get-RemoteLock
     if ($null -eq $check -or $check.nonce -ne $lock.nonce) {
@@ -230,7 +351,7 @@ function Update-LockHeartbeat {
         return
     }
     $Script:CurrentLock.heartbeatUtc = (Now-Iso)
-    Put-RemoteJson (Get-RemotePath 'lock.json') $Script:CurrentLock
+    Put-RemoteJson (Get-WorldPath 'lock.json') $Script:CurrentLock
 }
 
 function Release-Lock($Lock) {
@@ -240,7 +361,7 @@ function Release-Lock($Lock) {
         Write-Warn 'Remote lock is not ours anymore; leaving it in place.'
         return
     }
-    Invoke-Rclone @('deletefile', (Get-RemotePath 'lock.json')) -AllowFail | Out-Null
+    Invoke-Rclone @('deletefile', (Get-WorldPath 'lock.json')) -AllowFail | Out-Null
 }
 
 # ------------------------------------------------------------- save files ---
@@ -284,7 +405,7 @@ function Sync-Down($Latest) {
         return
     }
     if (-not $Latest.worldGuid) { throw 'latest.json has no worldGuid; remote data looks corrupt.' }
-    $state = Read-State
+    $state = Read-WorldState
     $saveRoot = Get-SaveRoot
     $target = Join-Path $saveRoot $Latest.worldGuid
     if (([int]$Latest.version -eq [int]$state.lastDownloadedVersion) -and (Test-Path $target)) {
@@ -293,7 +414,7 @@ function Sync-Down($Latest) {
     }
     $tmpZip = Join-Path $env:TEMP ('palrelay-dl-' + [guid]::NewGuid().ToString('n') + '.zip')
     Write-Info ('Downloading save v{0} ({1})...' -f $Latest.version, $Latest.zip)
-    Invoke-Rclone @('copyto', (Get-RemotePath ('saves/' + $Latest.zip)), $tmpZip) | Out-Null
+    Invoke-Rclone @('copyto', (Get-WorldPath ('saves/' + $Latest.zip)), $tmpZip) | Out-Null
     try {
         $hash = (Get-FileHash -Path $tmpZip -Algorithm SHA256).Hash
         if ($hash -ne $Latest.sha256) {
@@ -315,14 +436,14 @@ function Sync-Down($Latest) {
         Remove-Item $tmpZip -Force -ErrorAction SilentlyContinue
     }
     $state.lastDownloadedVersion = [int]$Latest.version
-    Write-State $state
+    Write-WorldState $state
     Write-Info ('Save v{0} ready.' -f $Latest.version)
 }
 
 function Prune-RemoteSaves {
     param([string]$KeepZip)
     $keep = [int]$Script:Config.keepVersions
-    $text = Invoke-RcloneText @('lsjson', (Get-RemotePath 'saves'))
+    $text = Invoke-RcloneText @('lsjson', (Get-WorldPath 'saves'))
     if ($null -eq $text -or $text.Trim() -eq '') { return }
     $all = ConvertFrom-JsonArray $text
     $items = @($all | Where-Object { $_.Name -match '^world-v(\d+)-.*\.zip$' })
@@ -332,7 +453,7 @@ function Prune-RemoteSaves {
     $extra = @($sorted | Select-Object -Skip $keep | Where-Object { $_.Name -ne $KeepZip })
     foreach ($it in $extra) {
         Write-Info ('Pruning old save {0}' -f $it.Name)
-        Invoke-Rclone @('deletefile', (Get-RemotePath ('saves/' + $it.Name))) -AllowFail | Out-Null
+        Invoke-Rclone @('deletefile', (Get-WorldPath ('saves/' + $it.Name))) -AllowFail | Out-Null
     }
 }
 
@@ -345,15 +466,22 @@ function Publish-Save {
     if (-not $safeName) { $safeName = 'player' }
     $zipName = ('world-v{0:d4}-{1}-{2}.zip' -f $NewVersion, (Now-Stamp), $safeName)
     $tmpZip = Join-Path $env:TEMP $zipName
+    $stage = Join-Path $env:TEMP ('palrelay-pub-' + [guid]::NewGuid().ToString('n'))
     if (Test-Path $tmpZip) { Remove-Item $tmpZip -Force }
     Write-Info ('Packing save (v{0})...' -f $NewVersion)
-    Compress-Archive -Path $SourceDir -DestinationPath $tmpZip -CompressionLevel Optimal
     try {
+        # Stage a copy so we can (a) zip safely while the server may still be
+        # flushing and (b) drop the server's own bulky "backup" subfolder.
+        New-Item -ItemType Directory -Path $stage | Out-Null
+        Copy-Item -Path $SourceDir -Destination $stage -Recurse
+        $stagedWorld = Join-Path $stage (Split-Path -Leaf $SourceDir)
+        Remove-Item (Join-Path $stagedWorld 'backup') -Recurse -Force -ErrorAction SilentlyContinue
+        Compress-Archive -Path $stagedWorld -DestinationPath $tmpZip -CompressionLevel Optimal
         $hash = (Get-FileHash -Path $tmpZip -Algorithm SHA256).Hash
         $size = (Get-Item $tmpZip).Length
         Write-Info ('Uploading {0} ({1:n1} MB)...' -f $zipName, ($size / 1MB))
-        Invoke-Rclone @('copyto', $tmpZip, (Get-RemotePath ('saves/' + $zipName))) | Out-Null
-        $listing = Invoke-RcloneText @('lsjson', (Get-RemotePath ('saves/' + $zipName)))
+        Invoke-Rclone @('copyto', $tmpZip, (Get-WorldPath ('saves/' + $zipName))) | Out-Null
+        $listing = Invoke-RcloneText @('lsjson', (Get-WorldPath ('saves/' + $zipName)))
         $entries = ConvertFrom-JsonArray $listing
         $entry = $null
         if ($entries.Count -gt 0) { $entry = $entries[0] }
@@ -370,12 +498,13 @@ function Publish-Save {
             uploadedUtc = (Now-Iso)
             toolVersion = $Script:ToolVersion
         }
-        Put-RemoteJson (Get-RemotePath 'latest.json') $latest
+        Put-RemoteJson (Get-WorldPath 'latest.json') $latest
         Prune-RemoteSaves -KeepZip $zipName
         $Script:SessionVersion = $NewVersion
         return $latest
     } finally {
         Remove-Item $tmpZip -Force -ErrorAction SilentlyContinue
+        Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -393,18 +522,19 @@ function Test-Prereqs {
 
 function Ensure-ServerSettings {
     # Self-provisions PalWorldSettings.ini (REST API on, admin password from
-    # config.json) so graceful shutdown always works. Running inside the host
-    # user's own session guarantees the file is visible to the server process.
+    # group.json/config.json) so graceful shutdown always works. Running inside
+    # the host user's own session guarantees the file is visible to the server.
     $cfg = $Script:Config
-    if (-not $cfg.adminPassword) {
-        Write-Warn 'adminPassword is empty in config.json - REST shutdown will not work.'
+    $adminPw = Get-AdminPassword
+    if (-not $adminPw) {
+        Write-Warn 'No adminPassword found (group.json or config.json) - REST shutdown will not work.'
         return
     }
     $iniDir = Join-Path $cfg.serverDir 'Pal\Saved\Config\WindowsServer'
     $ini = Join-Path $iniDir 'PalWorldSettings.ini'
     $base = ''
     if (Test-Path $ini) { $base = Get-Content -Raw -Path $ini }
-    $wantPw = 'AdminPassword="' + $cfg.adminPassword + '"'
+    $wantPw = 'AdminPassword="' + $adminPw + '"'
     $wantPort = 'RESTAPIPort=' + $cfg.restPort
     if ($base.Contains('RESTAPIEnabled=True') -and $base.Contains($wantPw) -and $base.Contains($wantPort)) {
         return
@@ -448,7 +578,7 @@ function Invoke-ServerApi {
     param([string]$Method, [string]$Endpoint, $BodyObj)
     $cfg = $Script:Config
     $auth = 'Basic ' + [Convert]::ToBase64String(
-        [Text.Encoding]::UTF8.GetBytes('admin:' + $cfg.adminPassword))
+        [Text.Encoding]::UTF8.GetBytes('admin:' + (Get-AdminPassword)))
     $params = @{
         Method     = $Method
         Uri        = ('http://127.0.0.1:{0}/v1/api/{1}' -f $cfg.restPort, $Endpoint)
@@ -508,16 +638,9 @@ function Invoke-Checkpoint {
     } catch {
         Write-Warn 'Checkpoint REST save failed; snapshotting current files anyway.'
     }
-    $stage = Join-Path $env:TEMP ('palrelay-cp-' + [guid]::NewGuid().ToString('n'))
-    New-Item -ItemType Directory -Path $stage | Out-Null
-    try {
-        Copy-Item -Path (Join-Path (Get-SaveRoot) $guid) -Destination $stage -Recurse
-        $newVersion = $Script:SessionVersion + 1
-        Publish-Save -SourceDir (Join-Path $stage $guid) -WorldGuid $guid -NewVersion $newVersion | Out-Null
-        Write-Info ('Checkpoint uploaded as v{0}.' -f $newVersion)
-    } finally {
-        Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
-    }
+    $newVersion = $Script:SessionVersion + 1
+    Publish-Save -SourceDir (Join-Path (Get-SaveRoot) $guid) -WorldGuid $guid -NewVersion $newVersion | Out-Null
+    Write-Info ('Checkpoint uploaded as v{0}.' -f $newVersion)
 }
 
 function Wait-Session($Proc) {
@@ -553,26 +676,26 @@ function Wait-Session($Proc) {
 
 function Cmd-Start {
     Test-Prereqs
-    $state = Read-State
+    $state = Read-WorldState
     if ($state.phase -eq 'hosting') {
-        Write-Warn 'Previous session did not finish uploading (crash or interrupted?).'
+        Write-Warn ('Previous session of world "{0}" did not finish uploading (crash or interrupted?).' -f $Script:WorldName)
         if (Confirm-Prompt 'Upload the local save now before starting a new session?' $true) {
             $code = Cmd-Upload
             if ($code -ne 0) { return $code }
         } else {
             Write-Warn 'Continuing WITHOUT uploading; remote may overwrite your local progress.'
             $state.phase = 'idle'
-            Write-State $state
+            Write-WorldState $state
         }
-        $state = Read-State
+        $state = Read-WorldState
     }
 
     $lock = Get-RemoteLock
     $staleTakeover = $false
     if ($lock -and -not (Test-LockOurs $lock)) {
         if (-not (Test-LockStale $lock)) {
-            Write-Err ('World is being hosted by {0} on {1} (started {2} UTC, heartbeat {3} UTC).' -f `
-                $lock.holder, $lock.machine, $lock.startedUtc, $lock.heartbeatUtc)
+            Write-Err ('World "{0}" is being hosted by {1} on {2} (started {3} UTC, heartbeat {4} UTC).' -f `
+                $Script:WorldName, $lock.holder, $lock.machine, $lock.startedUtc, $lock.heartbeatUtc)
             return 2
         }
         Write-Warn ('Found a STALE lock from {0} (last heartbeat {1} UTC).' -f $lock.holder, $lock.heartbeatUtc)
@@ -582,12 +705,15 @@ function Cmd-Start {
     }
 
     if ($staleTakeover) { $myLock = Acquire-Lock -AllowStaleTakeover } else { $myLock = Acquire-Lock }
-    Write-Info ('Lock acquired by {0}.' -f $myLock.holder)
+    Write-Info ('Lock acquired by {0} for world "{1}".' -f $myLock.holder, $Script:WorldName)
+    if ($myLock.hostIp) {
+        Write-Info ('Friends connect to: {0}:{1}' -f $myLock.hostIp, $myLock.serverPort)
+    }
 
     $published = $false
     $serverStarted = $false
     try {
-        $latest = Get-RemoteJson (Get-RemotePath 'latest.json')
+        $latest = Get-RemoteJson (Get-WorldPath 'latest.json')
         Sync-Down $latest
         $guid = Resolve-WorldGuid $latest
         if ($guid) { Ensure-DedicatedServerName $guid }
@@ -597,15 +723,15 @@ function Cmd-Start {
         if ($latest) { $baseVersion = [int]$latest.version }
         $Script:SessionVersion = $baseVersion
 
-        $state = Read-State
+        $state = Read-WorldState
         $state.phase = 'hosting'
         $state.hostingStartedUtc = (Now-Iso)
-        Write-State $state
+        Write-WorldState $state
 
         $proc = Start-Server
         $serverStarted = $true
         Write-Host ''
-        Write-Info 'Server starting. Friends can join once it is up (UDP 8211 / your Tailscale IP).'
+        Write-Info ('Server starting for world "{0}". Friends can join once it is up (UDP {1}).' -f $Script:WorldName, $Script:Config.serverPort)
         Write-Info 'Press [Q] in this window to stop the server and upload the save.'
         Write-Host ''
 
@@ -627,13 +753,13 @@ function Cmd-Start {
         $newVersion = $Script:SessionVersion + 1
         Publish-Save -SourceDir (Join-Path (Get-SaveRoot) $guid) -WorldGuid $guid -NewVersion $newVersion | Out-Null
 
-        $state = Read-State
+        $state = Read-WorldState
         $state.phase = 'idle'
         $state.lastDownloadedVersion = $newVersion
         $state.hostingStartedUtc = ''
-        Write-State $state
+        Write-WorldState $state
         $published = $true
-        Write-Info ('Uploaded save v{0}. Session complete - the world is free for the next host.' -f $newVersion)
+        Write-Info ('Uploaded save v{0}. Session complete - world "{1}" is free for the next host.' -f $newVersion, $Script:WorldName)
         return 0
     } finally {
         if ($published) {
@@ -654,7 +780,7 @@ function Cmd-Upload {
         Write-Err ('Cannot upload: {0} currently holds the lock (hosting). Use -Force only if you are certain.' -f $lock.holder)
         return 2
     }
-    $latest = Get-RemoteJson (Get-RemotePath 'latest.json')
+    $latest = Get-RemoteJson (Get-WorldPath 'latest.json')
     $guid = Resolve-WorldGuid $latest
     if (-not $guid) {
         Write-Err 'No world folder found under SaveGames\0 and no worldGuid configured.'
@@ -665,27 +791,30 @@ function Cmd-Upload {
     $newVersion = $base + 1
     Publish-Save -SourceDir (Join-Path (Get-SaveRoot) $guid) -WorldGuid $guid -NewVersion $newVersion | Out-Null
 
-    $state = Read-State
+    $state = Read-WorldState
     $state.phase = 'idle'
     $state.lastDownloadedVersion = $newVersion
     $state.hostingStartedUtc = ''
-    Write-State $state
+    Write-WorldState $state
 
     if ($lock -and (Test-LockOurs $lock)) { Release-Lock $lock }
-    Write-Info ('Uploaded save v{0}.' -f $newVersion)
+    Write-Info ('Uploaded save v{0} for world "{1}".' -f $newVersion, $Script:WorldName)
     return 0
 }
 
 function Cmd-Status {
     $lock = Get-RemoteLock
-    $latest = Get-RemoteJson (Get-RemotePath 'latest.json')
-    $state = Read-State
-    Write-Host '--- PalRelay status ---'
+    $latest = Get-RemoteJson (Get-WorldPath 'latest.json')
+    $state = Read-WorldState
+    Write-Host ('--- PalRelay status: world "' + $Script:WorldName + '" ---')
     if ($lock) {
         $staleTag = ''
         if (Test-LockStale $lock) { $staleTag = '  [STALE - takeover possible]' }
         Write-Host ('Hosting now : {0} on {1} (started {2} UTC, heartbeat {3} UTC){4}' -f `
             $lock.holder, $lock.machine, $lock.startedUtc, $lock.heartbeatUtc, $staleTag)
+        if ($lock.PSObject.Properties['hostIp'] -and $lock.hostIp) {
+            Write-Host ('Connect to  : {0}:{1}' -f $lock.hostIp, $lock.serverPort)
+        }
     } else {
         Write-Host 'Hosting now : nobody (world is free)'
     }
@@ -698,6 +827,66 @@ function Cmd-Status {
         Write-Host 'Latest save : none uploaded yet'
     }
     Write-Host ('Local state : phase={0}, lastDownloadedVersion={1}' -f $state.phase, $state.lastDownloadedVersion)
+    return 0
+}
+
+function Cmd-Worlds {
+    $worlds = Get-CloudWorlds
+    if ($worlds.Count -eq 0) {
+        Write-Host 'No worlds yet. Create one with: .\palrelay.ps1 start <name>'
+        return 0
+    }
+    Write-Host '--- PalRelay worlds ---'
+    $saved = $Script:WorldName
+    foreach ($w in $worlds) {
+        $Script:WorldName = $w
+        $lock = Get-RemoteLock
+        $latest = Get-RemoteJson (Get-WorldPath 'latest.json')
+        $status = 'free'
+        if ($lock) {
+            if (Test-LockStale $lock) { $status = ('STALE lock ({0})' -f $lock.holder) }
+            else { $status = ('hosted by {0}' -f $lock.holder) }
+        }
+        $ver = 'no saves'
+        if ($latest) { $ver = ('v{0} by {1} at {2}' -f $latest.version, $latest.uploadedBy, $latest.uploadedUtc) }
+        Write-Host ('  {0,-20} {1,-25} {2}' -f $w, $status, $ver)
+    }
+    $Script:WorldName = $saved
+    return 0
+}
+
+function Cmd-Init {
+    $dst = Join-Path $Script:ToolDir 'config.json'
+    if (Test-Path $dst) {
+        Write-Info 'config.json already exists; nothing to do.'
+        return 0
+    }
+    Copy-Item (Join-Path $Script:ToolDir 'config.sample.json') $dst
+    Write-Info 'Created config.json - edit playerName, remote and serverDir.'
+    return 0
+}
+
+function Show-Help {
+    Write-Host @"
+PalRelay v$($Script:ToolVersion) - rotating-host save sync for Palworld dedicated servers
+
+Usage: .\palrelay.ps1 <command> [world] [-Force]
+
+Commands:
+  start [world]     Acquire the lock, sync the latest save, run the server;
+                    press Q to stop, upload and release the lock.
+                    Starting an unknown world name creates a new world.
+  worlds            List all worlds and their status.
+  status [world]    Show who is hosting and the latest uploaded save version.
+  upload [world]    Upload the local save manually (crash recovery / seed).
+  takeover [world]  Remove a stale lock left behind by a crashed host.
+  init              Create config.json from config.sample.json.
+  help              Show this help.
+
+If [world] is omitted, the last used world is assumed.
+
+Docs: README.md (setup) / docs/DESIGN.md (protocol spec)
+"@
     return 0
 }
 
@@ -719,44 +908,13 @@ function Cmd-Takeover {
     }
     Write-Warn ('Removing lock held by {0}. Progress they did not upload will be lost.' -f $lock.holder)
     if (-not ($Force -or (Confirm-Prompt 'Proceed?' $false))) { return 2 }
-    Invoke-Rclone @('deletefile', (Get-RemotePath 'lock.json')) | Out-Null
+    Invoke-Rclone @('deletefile', (Get-WorldPath 'lock.json')) | Out-Null
     Write-Info 'Lock removed.'
     return 0
 }
 
-function Cmd-Init {
-    $dst = Join-Path $Script:ToolDir 'config.json'
-    if (Test-Path $dst) {
-        Write-Info 'config.json already exists; nothing to do.'
-        return 0
-    }
-    Copy-Item (Join-Path $Script:ToolDir 'config.sample.json') $dst
-    Write-Info 'Created config.json - edit playerName, remote, serverDir and adminPassword.'
-    return 0
-}
-
-function Show-Help {
-    Write-Host @"
-PalRelay v$($Script:ToolVersion) - rotating-host save sync for Palworld dedicated servers
-
-Usage: .\palrelay.ps1 <command> [-Force]
-
-Commands:
-  start     Acquire the lock, sync the latest save, run the server; press Q
-            to stop, upload and release the lock.
-  status    Show who is hosting and the latest uploaded save version.
-  upload    Upload the local save manually (crash recovery / first seed).
-  takeover  Remove a stale lock left behind by a crashed host.
-  init      Create config.json from config.sample.json.
-  help      Show this help.
-
-Docs: README.md (setup) / docs/DESIGN.md (protocol spec)
-"@
-    return 0
-}
-
 function Main {
-    param([string]$Cmd)
+    param([string]$Cmd, [string]$WorldArg)
     if ($Cmd -eq 'help') { $null = Show-Help; exit 0 }
     if ($Cmd -eq 'init') { exit (Cmd-Init) }
     try {
@@ -767,11 +925,17 @@ function Main {
     }
     $code = 1
     try {
-        switch ($Cmd) {
-            'start'    { $code = Cmd-Start }
-            'status'   { $code = Cmd-Status }
-            'upload'   { $code = Cmd-Upload }
-            'takeover' { $code = Cmd-Takeover }
+        Ensure-CloudLayout
+        if ($Cmd -eq 'worlds') {
+            $code = Cmd-Worlds
+        } else {
+            $Script:WorldName = Resolve-WorldName $WorldArg
+            switch ($Cmd) {
+                'start'    { $code = Cmd-Start }
+                'status'   { $code = Cmd-Status }
+                'upload'   { $code = Cmd-Upload }
+                'takeover' { $code = Cmd-Takeover }
+            }
         }
     } catch {
         Write-Err $_.Exception.Message
@@ -781,5 +945,5 @@ function Main {
 }
 
 if ($env:PALRELAY_TEST -ne '1') {
-    Main -Cmd $Command
+    Main -Cmd $Command -WorldArg $World
 }
