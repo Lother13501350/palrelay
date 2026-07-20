@@ -319,10 +319,18 @@ Exit codes:`0` 成功 / `1` 一般錯誤 / `2` 鎖被他人持有 / `3` 設定�
 - **`import` 指令**:掃描 `%LOCALAPPDATA%\Pal` 的 co-op 世界(以 LevelMeta
   解出世界名)→ 複製進伺服器(原檔不動)→ 刪 WorldOption.sav(讓 ini 生效)
   → 播種為雲端新世界 v1,並記錄既有玩家檔清單(state 的 `importPlayers`)
-- **`fixhost` 指令**:原主機第一次加入伺服器建立新角色後執行——palfix 做
-  完整四層搬遷(角色合併/帕魯 key 歸零與 Owner 修正/公會 blob 位元組修補/
-  容器欄位),依 `importPlayers` 自動辨識新角色檔,成功才上傳新版並釋放鎖;
-  失敗則雲端不動、本機標記重新下載
+- **`fixhost` 指令**:原主機第一次加入伺服器建立新角色後執行。策略為
+  **params swap**:把舊角色的 SaveParameter 灌進「伺服器親手建立並接受」的
+  新角色條目(其檔案/條目/公會接線全部保留原樣),另做帕魯 key 歸零、
+  Owner 修正、容器欄位修正與容器 re-key;依 `importPlayers` 自動辨識新角色檔
+- **保守模式(關鍵)**:所有寫入 Level.sav 的操作只解碼
+  CharacterSaveParameterMap 與 CharacterContainerSaveData(經驗證可正確
+  re-serialize);公會、物品容器 slots、地圖物件等半解碼結構一律原始位元組
+  直通。實戰教訓:全量解碼重寫會損壞新格式公會 blob,導致伺服器拒認玩家並
+  無限重生新角色
+- 明確不做:改寫 Players/*.sav(伺服器會拒收)、手改公會成員名單
+  (新格式為 ASCII hex 字串 + 未知結構;公會異動交給遊戲內操作)
+- 一次性代價:外觀維持新角色(遊戲內鏡子可改)、公會需遊戲內重邀
 - 訪客玩家的角色 GUID 在 co-op 與 dedicated 相同,毋須處理
 
 ## 13. 測試策略

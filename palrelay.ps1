@@ -26,7 +26,7 @@ $ErrorActionPreference = 'Stop'
 # non-ASCII world names get mangled on CJK-codepage consoles.
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
 
-$Script:ToolVersion = '0.3.1'
+$Script:ToolVersion = '0.4.0'
 $Script:ToolDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Script:StateFile = Join-Path $Script:ToolDir 'state.json'
 $Script:BackupRoot = Join-Path $Script:ToolDir 'backups'
@@ -1101,6 +1101,8 @@ function Cmd-Fixhost {
         Write-WorldState $ws
         Release-Lock $myLock
         Write-Info ('Done! Uploaded v{0}. The host gets their original character next session.' -f $newVersion)
+        Write-Info 'NOTE: appearance stays as the newly created character (adjust in-game with the antique mirror).'
+        Write-Info 'NOTE: the host starts in a personal guild - have a friend re-invite them to the group guild in-game.'
         return 0
     } catch {
         Write-Err $_.Exception.Message
