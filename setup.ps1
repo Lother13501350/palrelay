@@ -75,30 +75,65 @@ if ($rclone) {
     Good ('安裝完成:' + $rclone)
 }
 
-# --- 步驟 2/5:連接群組的雲端資料夾 ------------------------------------------
+# --- 步驟 2/5:群組的雲端資料夾 ----------------------------------------------
 Write-Host ''
-Say '[步驟 2/5] 連接群組的 Google Drive 共用資料夾'
-Say '  (請群主在 Google Drive 對資料夾按「共用」,把連結傳給你)'
-$folderId = $null
-while (-not $folderId) {
-    $link = Read-Host '  貼上共用資料夾的連結'
-    if ($link -match '/folders/([A-Za-z0-9_-]{10,})') { $folderId = $Matches[1] }
-    elseif ($link.Trim() -match '^[A-Za-z0-9_-]{10,}$') { $folderId = $link.Trim() }
-    else { Fail '  看不懂這個連結,請直接複製瀏覽器網址列的完整連結再試一次。' }
-}
-Good ('資料夾 ID:' + $folderId)
-
-Say '  接下來瀏覽器會開啟 Google 登入頁:請用你自己的 Google 帳號登入並按「允許」。'
-Read-Host '  準備好後按 Enter 繼續'
+Say '[步驟 2/5] 群組的 Google Drive 雲端資料夾'
 $rcloneConf = Join-Path $toolDir 'rclone.conf'
-$r = Invoke-Native $rclone @('config', 'create', 'gdrive', 'drive', 'scope=drive', ('root_folder_id=' + $folderId), '--config', $rcloneConf)
-if ($r.Code -ne 0) {
-    Fail ('Google 授權失敗:' + $r.Text)
-    exit 1
+$mode = ''
+while ($mode -ne '1' -and $mode -ne '2') {
+    $mode = (Read-Host '  你要 (1) 加入朋友的群組 還是 (2) 建立全新群組?輸入 1 或 2').Trim()
+}
+$isFounder = ($mode -eq '2')
+$shareUrl = ''
+if ($isFounder) {
+    Say '  接下來瀏覽器會開啟 Google 登入頁:用你的 Google 帳號登入並按「允許」。'
+    Read-Host '  準備好後按 Enter 繼續'
+    $r = Invoke-Native $rclone @('config', 'create', 'gdrive', 'drive', 'scope=drive', '--config', $rcloneConf)
+    if ($r.Code -ne 0) { Fail ('Google 授權失敗:' + $r.Text); exit 1 }
+    Say '  正在你的雲端硬碟建立「PalRelay」資料夾...'
+    $r = Invoke-Native $rclone @('--config', $rcloneConf, 'mkdir', 'gdrive:PalRelay')
+    if ($r.Code -ne 0) { Fail ('建立資料夾失敗:' + $r.Text); exit 1 }
+    $r = Invoke-Native $rclone @('--config', $rcloneConf, 'lsjson', '--dirs-only', 'gdrive:')
+    $folderId = $null
+    if ($r.Code -eq 0 -and $r.Text.Trim()) {
+        $dirs = ConvertFrom-Json -InputObject $r.Text
+        foreach ($d in @($dirs)) {
+            if ($d.Name -eq 'PalRelay' -and -not $folderId) { $folderId = [string]$d.ID }
+        }
+    }
+    if (-not $folderId) { Fail '找不到剛建立的資料夾 ID,請重跑一次精靈。'; exit 1 }
+    $r = Invoke-Native $rclone @('config', 'update', 'gdrive', ('root_folder_id=' + $folderId), '--config', $rcloneConf)
+    if ($r.Code -ne 0) { Fail ('鎖定資料夾失敗:' + $r.Text); exit 1 }
+    $shareUrl = 'https://drive.google.com/drive/folders/' + $folderId
+    [IO.File]::WriteAllText((Join-Path $toolDir 'share-link.txt'), $shareUrl, (New-Object System.Text.UTF8Encoding($false)))
+    Good '資料夾已建立!'
+    Say '  瀏覽器即將開啟這個資料夾。請按右上角「共用」,把每位朋友的'
+    Say '  Google 帳號加為「編輯者」,然後把這條連結傳到群組(朋友 setup 時要貼):'
+    Say ('    ' + $shareUrl)
+    Say '  (連結也已存到 share-link.txt,隨時找得到)'
+    Start-Process $shareUrl
+    Read-Host '  完成共用(或想稍後再共用)後按 Enter 繼續'
+} else {
+    Say '  (請群主把共用資料夾的連結傳給你;群主的連結在他的 share-link.txt)'
+    $folderId = $null
+    while (-not $folderId) {
+        $link = Read-Host '  貼上共用資料夾的連結'
+        if ($link -match '/folders/([A-Za-z0-9_-]{10,})') { $folderId = $Matches[1] }
+        elseif ($link.Trim() -match '^[A-Za-z0-9_-]{10,}$') { $folderId = $link.Trim() }
+        else { Fail '  看不懂這個連結,請直接複製瀏覽器網址列的完整連結再試一次。' }
+    }
+    Good ('資料夾 ID:' + $folderId)
+    Say '  接下來瀏覽器會開啟 Google 登入頁:請用你自己的 Google 帳號登入並按「允許」。'
+    Read-Host '  準備好後按 Enter 繼續'
+    $r = Invoke-Native $rclone @('config', 'create', 'gdrive', 'drive', 'scope=drive', ('root_folder_id=' + $folderId), '--config', $rcloneConf)
+    if ($r.Code -ne 0) {
+        Fail ('Google 授權失敗:' + $r.Text)
+        exit 1
+    }
 }
 $r = Invoke-Native $rclone @('--config', $rcloneConf, 'lsjson', 'gdrive:')
 if ($r.Code -ne 0) {
-    Fail '連不上共用資料夾。請確認群主有把資料夾分享給你(編輯者權限)。'
+    Fail '連不上資料夾。請確認群主有把資料夾分享給你(編輯者權限)。'
     exit 1
 }
 Good '雲端資料夾連線成功!'
@@ -181,6 +216,12 @@ Write-Host ''
 Say '=============================================='
 Say '  設定完成!'
 Say '  之後想玩:雙擊 palrelay-gui.cmd'
+if ($shareUrl) {
+    Say ''
+    Say '  別忘了把資料夾連結傳給朋友(也存在 share-link.txt):'
+    Say ('  ' + $shareUrl)
+}
+Say ''
 Say '  (建議也安裝 Tailscale 讓朋友連線更簡單:'
 Say '   https://tailscale.com/download 全員安裝後互加好友)'
 Say '=============================================='

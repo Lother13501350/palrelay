@@ -2,3 +2,4 @@ config.json
 state.json
 backups/
 rclone.conf
+share-link.txt
