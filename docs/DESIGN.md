@@ -65,18 +65,25 @@ sequenceDiagram
 
 ## 3. Google Drive 佈局
 
-一個共用資料夾 = 一個世界。由一人建立資料夾並分享給所有成員(編輯者權限),
+一個共用資料夾 = 一個群組,可容納任意多個世界(schema v2)。
+由一人建立資料夾並分享給所有成員(編輯者權限),
 每個成員的 rclone remote 以該資料夾為根(`root_folder_id`)。
 
 ```
 (共用資料夾根目錄)
-├── lock.json          # 存在 = 有人正在 host;不存在 = 世界空閒
-├── latest.json        # 指向最新存檔 zip 的指標(版本、檔名、sha256)
-└── saves/
-    ├── world-v0007-20260720-133000-lother.zip
-    ├── world-v0008-20260720-153000-amy.zip
-    └── ...            # 保留最近 keepVersions 份(預設 10)
+├── group.json               # 群組共用設定(adminPassword 等)
+└── worlds/
+    └── <世界名>/
+        ├── lock.json        # 存在 = 有人正在 host;不存在 = 世界空閒
+        ├── latest.json      # 指向最新存檔 zip 的指標(版本、檔名、sha256)
+        └── saves/
+            ├── world-v0007-20260720-133000-lother.zip
+            └── ...          # 保留最近 keepVersions 份(預設 10)
 ```
+
+v1(flat)佈局會在任一指令執行時自動遷移:`latest.json` 與 `saves/` 以
+rclone `moveto`(伺服器端搬移)移入 `worlds/main/`;若偵測到未過期的
+legacy 鎖則延後遷移。本機 `state.json` 亦同步升級為 per-world 結構。
 
 ## 4. 檔案格式規格
 
@@ -89,9 +96,14 @@ sequenceDiagram
   "nonce": "8f14e45f-....",
   "startedUtc": "2026-07-20T12:00:00.0000000Z",
   "heartbeatUtc": "2026-07-20T12:35:00.0000000Z",
-  "toolVersion": "0.1.0"
+  "hostIp": "100.101.102.103",
+  "serverPort": 8211,
+  "toolVersion": "0.2.0"
 }
 ```
+
+`hostIp` 為 host 的 Tailscale IP(偵測不到則空字串),`serverPort` 為遊戲埠;
+兩者一起構成公告給其他成員的連線位址,GUI 據此顯示「貼這個進遊戲」。
 
 | 欄位 | 說明 |
 |---|---|
@@ -140,13 +152,24 @@ sequenceDiagram
 | `rcloneConfig` | | `""` | rclone 設定檔路徑(`--config`);留空使用 rclone 預設位置 |
 | `serverExe` | | `PalServer.exe` | 伺服器執行檔名 |
 | `serverArgs` | | `[]` | 額外啟動參數(如 `-publiclobby`) |
-| `adminPassword` | | `""` | 需與 `PalWorldSettings.ini` 的 `AdminPassword` 一致(REST 認證用) |
+| `adminPassword` | | `""` | 通常留空(自動改用雲端 `group.json` 的密碼);群組創始人首次執行時填這裡,工具會自動上傳成 group.json |
+| `serverPort` | | `8211` | 遊戲連線埠(公告用) |
 | `restPort` | | `8212` | REST API 埠 |
 | `heartbeatMinutes` | | `5` | 心跳間隔 |
 | `staleMinutes` | | `20` | 心跳超過此分鐘數視為過期鎖 |
 | `checkpointMinutes` | | `0`(關閉) | >0 時每 N 分鐘自動上傳一次期中存檔 |
 | `keepVersions` | | `10` | 雲端保留的 zip 份數 |
 | `worldGuid` | | `""` | 通常自動偵測;`SaveGames/0` 下有多個資料夾時才需指定 |
+
+### 4.5 `group.json`(雲端根目錄)
+
+```json
+{ "schemaVersion": 2, "adminPassword": "...", "createdBy": "lother", "createdUtc": "..." }
+```
+
+伺服器管理密碼的唯一真相來源:REST API 認證與 `PalWorldSettings.ini`
+自動配置皆由此讀取,成員 config 免填、群主改密碼全群自動生效。
+密碼解析順序:`group.json` → 本機 config(舊版相容/創始人引導)→ 空(警告)。
 
 ## 5. 鎖協議
 
@@ -207,7 +230,8 @@ stateDiagram-v2
 ## 7. 上傳與版本管理
 
 1. 對執行中伺服器先呼叫 REST `/save`(checkpoint 情境),或已關機(正常結束)
-2. `Compress-Archive` 打包 `SaveGames/0/<worldGuid>/` 整個資料夾為
+2. 將 `SaveGames/0/<worldGuid>/` 複製到暫存區(**排除伺服器自己的 `backup/`
+   子資料夾**,避免 zip 無限膨脹),再 `Compress-Archive` 打包為
    `world-v{版本:4位}-{UTC時間戳}-{玩家}.zip`
 3. 計算 SHA-256,`rclone copyto` 上傳至 `saves/`
 4. `rclone lsjson` 回讀檔案大小驗證上傳完整
@@ -251,17 +275,22 @@ stateDiagram-v2
 ## 10. CLI 規格
 
 ```
-palrelay.ps1 <command> [-Force]
+palrelay.ps1 <command> [world] [-Force]
 ```
 
 | 指令 | 功能 |
 |---|---|
-| `start` | 完整 session:取鎖 → 下載 → 開服 → (按 Q)關服 → 上傳 → 釋放鎖 |
-| `status` | 顯示誰在 host、最新版本、本機狀態 |
-| `upload` | 手動上傳本機存檔(當機復原、首次播種) |
-| `takeover` | 清除過期鎖(新鮮鎖需 `-Force`) |
+| `start [world]` | 完整 session:取鎖 → 下載 → 開服 → (按 Q)關服 → 上傳 → 釋放鎖;新名字即建立新世界 |
+| `worlds` | 列出所有世界(鎖狀態、最新版本) |
+| `status [world]` | 顯示誰在 host、最新版本、本機狀態 |
+| `upload [world]` | 手動上傳本機存檔(當機復原、首次播種) |
+| `takeover [world]` | 清除過期鎖(新鮮鎖需 `-Force`) |
 | `init` | 從 `config.sample.json` 建立 `config.json` |
 | `help` | 說明 |
+
+省略 `[world]` 時依序採用:上次使用的世界 → 雲端唯一的世界 → `main`。
+GUI(`palrelay-gui.ps1`)以 dot-source 重用本體並覆寫 console I/O 函式,
+協議行為與 CLI 完全一致。
 
 Exit codes:`0` 成功 / `1` 一般錯誤 / `2` 鎖被他人持有 / `3` 設定錯誤 / `5` 伺服器異常結束且未上傳。
 
