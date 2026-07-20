@@ -3,3 +3,5 @@ state.json
 backups/
 rclone.conf
 share-link.txt
+tools/palfix.exe
+tools/libooz.dll

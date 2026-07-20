@@ -186,7 +186,33 @@ Assert ((Resolve-WorldName 'explicit') -eq 'explicit') 'explicit world name wins
 Assert ((Resolve-WorldName '') -eq 'second') 'omitted world falls back to lastWorld'
 Assert-Throws { Resolve-WorldName 'bad/name' } 'invalid world name rejected'
 
-# T12: corrupted download is rejected -----------------------------------------
+# T12: co-op world import ----------------------------------------------------
+$coopRoot = Join-Path $work 'CoopSaves'
+$coopGuid = '11112222333344445555666677778888'
+$coopWorld = Join-Path $coopRoot "7656000011112222\$coopGuid"
+New-Item -ItemType Directory -Path (Join-Path $coopWorld 'Players') -Force | Out-Null
+Set-Content -Path (Join-Path $coopWorld 'Level.sav') -Value 'coop-level-data'
+Set-Content -Path (Join-Path $coopWorld 'LevelMeta.sav') -Value 'coop-meta'
+Set-Content -Path (Join-Path $coopWorld 'WorldOption.sav') -Value 'coop-options'
+Set-Content -Path (Join-Path $coopWorld 'Players\00000000000000000000000000000001.sav') -Value 'host-char'
+Set-Content -Path (Join-Path $coopWorld 'Players\AAAA0000000000000000000000000000.sav') -Value 'guest-char'
+$Script:CoopSaveRoot = $coopRoot
+$Script:Config.serverDir = $serverDir1
+$found = Find-CoopWorlds
+Assert ($found.Count -eq 1 -and $found[0].Guid -eq $coopGuid) 'find-coopworlds discovers the world'
+Import-CoopWorld -SourceDir $found[0].Path -TargetWorld 'imported'
+$importedLocal = Join-Path $saveRoot1 $coopGuid
+Assert (Test-Path (Join-Path $importedLocal 'Level.sav')) 'import copies world into server'
+Assert (-not (Test-Path (Join-Path $importedLocal 'WorldOption.sav'))) 'import drops WorldOption.sav'
+Assert (Test-Path (Join-Path $coopWorld 'WorldOption.sav')) 'original co-op save untouched'
+$importedLatest = Get-RemoteJson (Get-WorldPath 'latest.json')
+Assert ($null -ne $importedLatest -and [int]$importedLatest.version -eq 1) 'import seeds cloud v1'
+Assert ($importedLatest.worldGuid -eq $coopGuid) 'import records source guid'
+$iws = Read-WorldState
+Assert (@($iws.importPlayers).Count -eq 2) 'import records pre-existing player files'
+Assert-Throws { Import-CoopWorld -SourceDir $found[0].Path -TargetWorld 'imported' } 'import refuses duplicate world name'
+
+# T13: corrupted download is rejected -----------------------------------------
 $Script:WorldName = 'main'
 $Script:Config.serverDir = $serverDir3
 Write-WorldState ([pscustomobject]@{ phase = 'idle'; lastDownloadedVersion = 0; hostingStartedUtc = '' })

@@ -42,14 +42,25 @@ Google Drive 同步,不用租 24 小時的雲端伺服器,支援多個世界。
 3. 開玩!GUI 按「+ 新世界」可以開任意多個世界,同一個資料夾全部搞定;
    伺服器管理密碼由精靈自動產生並存在雲端,成員完全不用碰
 
-### 搬移現有的 co-op 世界
+### 搬移現有的 co-op 世界(內建匯入!)
 
-co-op 存檔的主機角色卡在特殊槽位,需要一次性轉換:用
-[PalworldSaveTools](https://github.com/deafdudecomputers/PalworldSaveTools) 或
-[Physgun 網頁轉換器](https://physgun.com/tools/palworld-save-converter/)
-轉成 dedicated server 存檔,放進
-`PalServer\Pal\Saved\SaveGames\0\<世界資料夾>`,然後
-`.\palrelay.ps1 upload <世界名>` 播種。之後就不用再碰了。
+想把你們**原本在遊戲裡玩的世界**搬進來?一條指令 + 一次登入:
+
+```powershell
+.\palrelay.ps1 import      # 列出你電腦裡所有 co-op 世界(含世界名),選一個 → 自動搬進伺服器並上傳雲端
+```
+
+之後做一次性的主機角色搬遷(co-op 的主機角色卡在特殊槽位):
+
+1. 開服一次(GUI 或 `start`)
+2. **原本當主機的人**連進伺服器,建立一個新角色,然後下線
+3. 收工(Q)後執行 `.\palrelay.ps1 fixhost <世界名>` —— 舊角色的一切
+   (等級、背包、帕魯、公會)會自動搬到新角色上並上傳
+
+當初的訪客玩家不用做任何事,角色自動延續。原本的 co-op 存檔完全不會被動到。
+匯入需要 `tools\palfix.exe`(Release zip 已附)與 libooz.dll
+(首次使用時會徵求同意後從 [zao/ooz](https://github.com/zao/ooz) 官方 release 下載,
+新版 PlM 存檔格式的開源解壓器)。
 
 ---
 

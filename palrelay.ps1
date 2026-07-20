@@ -13,7 +13,7 @@
 
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('start', 'status', 'upload', 'takeover', 'worlds', 'init', 'help')]
+    [ValidateSet('start', 'status', 'upload', 'takeover', 'worlds', 'import', 'fixhost', 'init', 'help')]
     [string]$Command = 'help',
     [Parameter(Position = 1)]
     [string]$World = '',
@@ -22,7 +22,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$Script:ToolVersion = '0.2.0'
+$Script:ToolVersion = '0.3.0'
 $Script:ToolDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Script:StateFile = Join-Path $Script:ToolDir 'state.json'
 $Script:BackupRoot = Join-Path $Script:ToolDir 'backups'
@@ -32,6 +32,12 @@ $Script:SessionVersion = 0
 $Script:WorldName = ''
 $Script:GroupConfig = $null
 $Script:GroupConfigLoaded = $false
+$Script:CoopSaveRoot = $null
+# libooz.dll (Oodle decompressor for the PlM save format) is fetched on demand
+# from the upstream zao/ooz release; it is NOT redistributed with PalRelay
+# because zao/ooz carries no explicit license.
+$Script:OozUrl = 'https://github.com/zao/ooz/releases/download/v0.2.4/bun-0.2.4-x64-Release.zip'
+$Script:OozSha256 = '473D94EC899E00E30E4B360C3E9D3B8E949D5A3AE6E962B0F090BA439249C7D7'
 
 # ---------------------------------------------------------------- output ----
 
@@ -476,6 +482,8 @@ function Publish-Save {
         Copy-Item -Path $SourceDir -Destination $stage -Recurse
         $stagedWorld = Join-Path $stage (Split-Path -Leaf $SourceDir)
         Remove-Item (Join-Path $stagedWorld 'backup') -Recurse -Force -ErrorAction SilentlyContinue
+        Get-ChildItem -Path $stagedWorld -Recurse -Filter '*.palfix-bak' -ErrorAction SilentlyContinue |
+            Remove-Item -Force -ErrorAction SilentlyContinue
         Compress-Archive -Path $stagedWorld -DestinationPath $tmpZip -CompressionLevel Optimal
         $hash = (Get-FileHash -Path $tmpZip -Algorithm SHA256).Hash
         $size = (Get-Item $tmpZip).Length
@@ -855,6 +863,239 @@ function Cmd-Worlds {
     return 0
 }
 
+# ---------------------------------------------------------- co-op import ---
+
+function Find-CoopWorlds {
+    $root = $Script:CoopSaveRoot
+    if (-not $root) { $root = Join-Path $env:LOCALAPPDATA 'Pal\Saved\SaveGames' }
+    $found = @()
+    if (Test-Path $root) {
+        foreach ($acct in Get-ChildItem -Path $root -Directory) {
+            foreach ($w in Get-ChildItem -Path $acct.FullName -Directory) {
+                if (Test-Path (Join-Path $w.FullName 'Level.sav')) {
+                    $found += [pscustomobject]@{
+                        Path = $w.FullName; Guid = $w.Name; Modified = $w.LastWriteTime
+                    }
+                }
+            }
+        }
+    }
+    return ,@($found | Sort-Object Modified -Descending)
+}
+
+function Get-PalfixPath {
+    $p = Join-Path $Script:ToolDir 'tools\palfix.exe'
+    if (Test-Path $p) { return $p }
+    return $null
+}
+
+function Ensure-OozDll {
+    param([switch]$Quiet)
+    $dll = Join-Path $Script:ToolDir 'tools\libooz.dll'
+    if (Test-Path $dll) { return $dll }
+    if ($Quiet) { return $null }
+    Write-Info 'The PlM save format needs the open-source Oodle decompressor (libooz.dll).'
+    if (-not (Confirm-Prompt 'Download libooz.dll from the official zao/ooz GitHub release (~110 KB)?' $true)) {
+        return $null
+    }
+    $tmpZip = Join-Path $env:TEMP ('ooz-' + [guid]::NewGuid().ToString('n') + '.zip')
+    $tmpDir = Join-Path $env:TEMP ('ooz-x-' + [guid]::NewGuid().ToString('n'))
+    try {
+        Invoke-WebRequest -Uri $Script:OozUrl -OutFile $tmpZip
+        Expand-Archive -Path $tmpZip -DestinationPath $tmpDir -Force
+        $src = Get-ChildItem -Path $tmpDir -Filter 'libooz.dll' -Recurse | Select-Object -First 1
+        if (-not $src) { throw 'libooz.dll not found inside the downloaded archive.' }
+        $hash = (Get-FileHash -Path $src.FullName -Algorithm SHA256).Hash
+        if ($hash -ne $Script:OozSha256) { throw ('libooz.dll SHA-256 mismatch: ' + $hash) }
+        New-Item -ItemType Directory -Path (Join-Path $Script:ToolDir 'tools') -Force | Out-Null
+        Copy-Item -Path $src.FullName -Destination $dll
+        Write-Info 'libooz.dll installed to tools\.'
+        return $dll
+    } finally {
+        Remove-Item $tmpZip -Force -ErrorAction SilentlyContinue
+        Remove-Item $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Invoke-Palfix {
+    # Runs palfix.exe and returns the parsed JSON result object (or throws).
+    param([string[]]$Arguments)
+    $palfix = Get-PalfixPath
+    if (-not $palfix) { throw 'tools\palfix.exe is missing. Use a release zip that includes it.' }
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $out = & $palfix @Arguments 2>$null
+    $code = $LASTEXITCODE
+    $ErrorActionPreference = $prev
+    $line = ''
+    if ($out) { $line = [string](@($out)[-1]) }
+    $json = $null
+    if ($line) { try { $json = ConvertFrom-Json -InputObject $line } catch {} }
+    if ($null -eq $json) { throw ('palfix produced no result (exit {0}).' -f $code) }
+    if (-not $json.ok) { throw ('palfix: ' + $json.error) }
+    return $json
+}
+
+function Get-CoopWorldName([string]$Dir) {
+    if (-not (Get-PalfixPath)) { return $null }
+    if (-not (Ensure-OozDll -Quiet)) { return $null }
+    try { return (Invoke-Palfix @('meta', '--dir', $Dir)).worldName } catch { return $null }
+}
+
+function Import-CoopWorld {
+    param([string]$SourceDir, [string]$TargetWorld)
+    $worlds = Get-CloudWorlds
+    if ($worlds -contains $TargetWorld) {
+        throw ('World "{0}" already exists in the cloud; pick another name.' -f $TargetWorld)
+    }
+    $guid = Split-Path -Leaf $SourceDir
+    $saveRoot = Get-SaveRoot
+    $target = Join-Path $saveRoot $guid
+    if (Test-Path $target) {
+        throw ('A local world folder with the same id already exists: {0}' -f $target)
+    }
+    Write-Info ('Copying world {0} into the server (original stays untouched)...' -f $guid)
+    if (-not (Test-Path $saveRoot)) { New-Item -ItemType Directory -Path $saveRoot -Force | Out-Null }
+    Copy-Item -Path $SourceDir -Destination $saveRoot -Recurse
+    Remove-Item (Join-Path $target 'backup') -Recurse -Force -ErrorAction SilentlyContinue
+    $wo = Join-Path $target 'WorldOption.sav'
+    if (Test-Path $wo) {
+        Remove-Item $wo -Force
+        Write-Info 'Removed WorldOption.sav so server settings come from PalWorldSettings.ini.'
+    }
+    $Script:WorldName = $TargetWorld
+    Ensure-DedicatedServerName $guid
+    $preexisting = @()
+    $pdir = Join-Path $target 'Players'
+    if (Test-Path $pdir) {
+        $preexisting = @(Get-ChildItem -Path $pdir -Filter '*.sav' | ForEach-Object { $_.BaseName.ToUpper() })
+    }
+    $null = Publish-Save -SourceDir $target -WorldGuid $guid -NewVersion 1
+    $ws = Read-WorldState
+    $ws.phase = 'idle'
+    $ws.lastDownloadedVersion = 1
+    $ws.hostingStartedUtc = ''
+    $ws | Add-Member -NotePropertyName importPlayers -NotePropertyValue $preexisting -Force
+    Write-WorldState $ws
+}
+
+function Cmd-Import {
+    $coop = Find-CoopWorlds
+    if ($coop.Count -eq 0) {
+        Write-Err 'No co-op worlds found under %LOCALAPPDATA%\Pal\Saved\SaveGames.'
+        return 3
+    }
+    Write-Host 'Local co-op worlds:'
+    for ($i = 0; $i -lt $coop.Count; $i++) {
+        $w = $coop[$i]
+        $name = Get-CoopWorldName $w.Path
+        if (-not $name) { $name = '(name unavailable)' }
+        Write-Host ('  [{0}] {1}  last played {2}  ({3})' -f ($i + 1), $name, $w.Modified, $w.Guid)
+    }
+    $pick = Read-Host 'Which world do you want to import? (number)'
+    $idx = 0
+    if (-not [int]::TryParse($pick, [ref]$idx) -or $idx -lt 1 -or $idx -gt $coop.Count) {
+        Write-Err 'Invalid choice.'
+        return 3
+    }
+    $src = $coop[$idx - 1]
+    $targetName = (Read-Host 'Name for this world in the cloud (shown to friends)').Trim()
+    if (-not $targetName) { Write-Err 'No name given.'; return 3 }
+    if ($targetName -match '[\\/:*?"<>|]') { Write-Err 'Names must not contain \ / : * ? " < > |'; return 3 }
+    Import-CoopWorld -SourceDir $src.Path -TargetWorld $targetName
+    Write-Info ('World imported and uploaded as v1 of "{0}".' -f $targetName)
+    Write-Host ''
+    Write-Info 'NEXT: migrate the original co-op HOST character (one-time):'
+    Write-Info ('  1. Host this world once (GUI, or: .\palrelay.ps1 start "{0}")' -f $targetName)
+    Write-Info '  2. The ORIGINAL HOST joins the server and creates a new character.'
+    Write-Info ('  3. End the session (Q), then run: .\palrelay.ps1 fixhost "{0}"' -f $targetName)
+    Write-Info 'Friends who were guests keep their characters automatically.'
+    return 0
+}
+
+function Cmd-Fixhost {
+    if (-not (Get-PalfixPath)) {
+        Write-Err 'tools\palfix.exe is missing. Download a release zip that includes it.'
+        return 3
+    }
+    if (-not (Ensure-OozDll)) {
+        Write-Err 'libooz.dll is required to read the current save format.'
+        return 3
+    }
+    $lock = Get-RemoteLock
+    if ($lock -and -not (Test-LockOurs $lock) -and -not (Test-LockStale $lock)) {
+        Write-Err ('{0} is hosting this world right now; run fixhost after they finish.' -f $lock.holder)
+        return 2
+    }
+    $latest = Get-RemoteJson (Get-WorldPath 'latest.json')
+    if ($null -eq $latest) {
+        Write-Err 'This world has no cloud save yet.'
+        return 3
+    }
+    Sync-Down $latest
+    $guid = Resolve-WorldGuid $latest
+    $worldDir = Join-Path (Get-SaveRoot) $guid
+    $pdir = Join-Path $worldDir 'Players'
+    $oldHex = '00000000000000000000000000000001'
+    if (-not (Test-Path (Join-Path $pdir ($oldHex + '.sav')))) {
+        Write-Info 'No legacy co-op host slot in this world - nothing to fix.'
+        return 0
+    }
+    $ws = Read-WorldState
+    $known = @($oldHex)
+    if ($ws.PSObject.Properties['importPlayers'] -and $ws.importPlayers) { $known += @($ws.importPlayers) }
+    $candidates = @(Get-ChildItem -Path $pdir -Filter '*.sav' |
+        ForEach-Object { $_.BaseName.ToUpper() } |
+        Where-Object { $known -notcontains $_ })
+    $newGuid = $null
+    if ($candidates.Count -eq 1) {
+        $newGuid = $candidates[0]
+    } elseif ($candidates.Count -eq 0) {
+        Write-Err 'No new character file found. The original host must join the server once and create a character first.'
+        return 3
+    } else {
+        Write-Host 'Several candidate character files:'
+        for ($i = 0; $i -lt $candidates.Count; $i++) { Write-Host ('  [{0}] {1}' -f ($i + 1), $candidates[$i]) }
+        $pick = Read-Host 'Which is the NEW character the host just created? (number)'
+        $idx = 0
+        if (-not [int]::TryParse($pick, [ref]$idx) -or $idx -lt 1 -or $idx -gt $candidates.Count) {
+            Write-Err 'Invalid choice.'
+            return 3
+        }
+        $newGuid = $candidates[$idx - 1]
+    }
+    Write-Info ('Migrating the host character onto {0}...' -f $newGuid)
+    if (-not (Confirm-Prompt 'This edits the world save (backups kept, cloud untouched until success). Continue?' $true)) {
+        return 2
+    }
+    $myLock = Acquire-Lock
+    try {
+        $dll = Join-Path $Script:ToolDir 'tools\libooz.dll'
+        $result = Invoke-Palfix @('--ooz-dll', $dll, 'fix', '--dir', $worldDir, '--new-guid', $newGuid)
+        Write-Info ('Character migrated. Pals re-keyed: {0}, owners fixed: {1}, container slots: {2}.' -f `
+            $result.palsRekeyed, $result.ownerFixed, $result.containerSlotsFixed)
+        $newVersion = [int]$latest.version + 1
+        Publish-Save -SourceDir $worldDir -WorldGuid $guid -NewVersion $newVersion | Out-Null
+        $ws = Read-WorldState
+        $ws.phase = 'idle'
+        $ws.lastDownloadedVersion = $newVersion
+        $ws.hostingStartedUtc = ''
+        Write-WorldState $ws
+        Release-Lock $myLock
+        Write-Info ('Done! Uploaded v{0}. The host gets their original character next session.' -f $newVersion)
+        return 0
+    } catch {
+        Write-Err $_.Exception.Message
+        # Cloud copy is untouched; force a clean re-download next time.
+        $ws = Read-WorldState
+        $ws.lastDownloadedVersion = 0
+        Write-WorldState $ws
+        Release-Lock $myLock
+        Write-Warn 'Local copy may be half-modified; it will be re-downloaded from the cloud next session.'
+        return 1
+    }
+}
+
 function Cmd-Init {
     $dst = Join-Path $Script:ToolDir 'config.json'
     if (Test-Path $dst) {
@@ -880,6 +1121,8 @@ Commands:
   status [world]    Show who is hosting and the latest uploaded save version.
   upload [world]    Upload the local save manually (crash recovery / seed).
   takeover [world]  Remove a stale lock left behind by a crashed host.
+  import            Import an existing co-op world from the local game saves.
+  fixhost [world]   Migrate the co-op host character after the first join.
   init              Create config.json from config.sample.json.
   help              Show this help.
 
@@ -928,6 +1171,8 @@ function Main {
         Ensure-CloudLayout
         if ($Cmd -eq 'worlds') {
             $code = Cmd-Worlds
+        } elseif ($Cmd -eq 'import') {
+            $code = Cmd-Import
         } else {
             $Script:WorldName = Resolve-WorldName $WorldArg
             switch ($Cmd) {
@@ -935,6 +1180,7 @@ function Main {
                 'status'   { $code = Cmd-Status }
                 'upload'   { $code = Cmd-Upload }
                 'takeover' { $code = Cmd-Takeover }
+                'fixhost'  { $code = Cmd-Fixhost }
             }
         }
     } catch {

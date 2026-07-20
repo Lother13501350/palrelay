@@ -1,0 +1,33 @@
+name: build-palfix
+
+on:
+  push:
+    paths:
+      - 'tools/**'
+      - '.github/workflows/build-palfix.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install palworld-save-tools==0.24.0 pyinstaller
+      - name: Overlay hostfix-toolkit patches (pinned commit, MIT)
+        shell: powershell
+        run: |
+          git clone https://github.com/quadrantbs/palworld-hostfix-toolkit tk
+          git -C tk checkout 306dd72f73b09c815b91b3744c1a297c3074dc3b
+          $site = python -c "import palworld_save_tools, os; print(os.path.dirname(palworld_save_tools.__file__))"
+          Copy-Item tk/patched_palworld_save_tools/palsav.py $site -Force
+          Copy-Item tk/patched_palworld_save_tools/rawdata/*.py (Join-Path $site 'rawdata') -Force
+      - name: Build palfix.exe
+        run: pyinstaller --onefile --name palfix tools/palfix.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: palfix
+          path: dist/palfix.exe
