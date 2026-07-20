@@ -1,0 +1,16 @@
+{
+  "playerName": "your-name",
+  "remote": "gdrive:",
+  "serverDir": "C:\\PalServer",
+  "rclonePath": "rclone",
+  "rcloneConfig": "",
+  "serverExe": "PalServer.exe",
+  "serverArgs": [],
+  "adminPassword": "",
+  "restPort": 8212,
+  "heartbeatMinutes": 5,
+  "staleMinutes": 20,
+  "checkpointMinutes": 0,
+  "keepVersions": 10,
+  "worldGuid": ""
+}
