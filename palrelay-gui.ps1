@@ -162,8 +162,13 @@ function Set-HostingUi([bool]$On) {
         if ($Script:GuiLock -and $Script:GuiLock.hostIp) {
             $ConnectBox.Text = ($Script:GuiLock.hostIp + ':' + $Script:GuiLock.serverPort)
             $CopyBtn.IsEnabled = $true
+            $src = ''
+            if ($Script:GuiLock.PSObject.Properties['hostIpSource']) { $src = [string]$Script:GuiLock.hostIpSource }
+            if ($src -eq 'public') {
+                Gui-Log '注意:這是對外 IP,你的路由器必須開 UDP 8211 轉發朋友才連得進來;全員安裝 Tailscale 可免設定。'
+            }
         } else {
-            $ConnectBox.Text = '(沒偵測到 Tailscale,朋友需用你的對外 IP 連線)'
+            $ConnectBox.Text = '(抓不到連線位址:請安裝 Tailscale 後重開,或自行查詢對外 IP)'
         }
         $WorldCombo.IsEnabled = $false
         $NewWorldBtn.IsEnabled = $false

@@ -293,17 +293,26 @@ function Resolve-WorldName([string]$Requested) {
 
 # ------------------------------------------------------------------ lock ----
 
-function Get-HostIp {
-    # Tailscale IP lets friends connect without port forwarding; best effort.
+function Get-HostIpInfo {
+    # Preferred: Tailscale IP (stable, no router setup needed).
     try {
         $prev = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
         $ip = & tailscale ip -4 2>$null | Select-Object -First 1
         $code = $LASTEXITCODE
         $ErrorActionPreference = $prev
-        if ($code -eq 0 -and $ip) { return ([string]$ip).Trim() }
+        if ($code -eq 0 -and $ip) {
+            return [pscustomobject]@{ Ip = ([string]$ip).Trim(); Source = 'tailscale' }
+        }
     } catch {}
-    return ''
+    # Fallback: public IP - only reachable if the host forwards UDP 8211.
+    try {
+        $pub = Invoke-RestMethod -Uri 'https://api.ipify.org' -TimeoutSec 5
+        if (([string]$pub).Trim() -match '^\d{1,3}(\.\d{1,3}){3}$') {
+            return [pscustomobject]@{ Ip = ([string]$pub).Trim(); Source = 'public' }
+        }
+    } catch {}
+    return [pscustomobject]@{ Ip = ''; Source = '' }
 }
 
 function Get-RemoteLock { return Get-RemoteJson (Get-WorldPath 'lock.json') }
@@ -330,13 +339,15 @@ function Acquire-Lock {
         }
         Write-Warn ('Taking over stale lock from {0}.' -f $existing.holder)
     }
+    $ipInfo = Get-HostIpInfo
     $lock = [pscustomobject]@{
         holder       = $Script:Config.playerName
         machine      = $env:COMPUTERNAME
         nonce        = [guid]::NewGuid().ToString()
         startedUtc   = (Now-Iso)
         heartbeatUtc = (Now-Iso)
-        hostIp       = (Get-HostIp)
+        hostIp       = $ipInfo.Ip
+        hostIpSource = $ipInfo.Source
         serverPort   = [int]$Script:Config.serverPort
         toolVersion  = $Script:ToolVersion
     }
@@ -720,6 +731,9 @@ function Cmd-Start {
     Write-Info ('Lock acquired by {0} for world "{1}".' -f $myLock.holder, $Script:WorldName)
     if ($myLock.hostIp) {
         Write-Info ('Friends connect to: {0}:{1}' -f $myLock.hostIp, $myLock.serverPort)
+        if ($myLock.hostIpSource -eq 'public') {
+            Write-Warn 'That is your PUBLIC IP: your router must forward UDP 8211, or friends cannot reach you. Installing Tailscale on everyone avoids this.'
+        }
     }
 
     $published = $false
