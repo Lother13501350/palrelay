@@ -26,7 +26,7 @@ $ErrorActionPreference = 'Stop'
 # non-ASCII world names get mangled on CJK-codepage consoles.
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
 
-$Script:ToolVersion = '0.4.0'
+$Script:ToolVersion = '0.4.1'
 $Script:ToolDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Script:StateFile = Join-Path $Script:ToolDir 'state.json'
 $Script:BackupRoot = Join-Path $Script:ToolDir 'backups'
@@ -1092,6 +1092,10 @@ function Cmd-Fixhost {
         $result = Invoke-Palfix @('--ooz-dll', $dll, 'fix', '--dir', $worldDir, '--new-guid', $newGuid)
         Write-Info ('Character migrated. Pals re-keyed: {0}, owners fixed: {1}, container slots: {2}.' -f `
             $result.palsRekeyed, $result.ownerFixed, $result.containerSlotsFixed)
+        if ($result.PSObject.Properties['verify'] -and $result.verify.ok) {
+            Write-Info ('Identity chain VERIFIED: player file -> character "{0}" (Lv.{1}) -> guild -> {2}/{3} containers all consistent.' -f `
+                $result.verify.nickname, $result.verify.level, $result.verify.containersFound, $result.verify.containersExpected)
+        }
         $newVersion = [int]$latest.version + 1
         Publish-Save -SourceDir $worldDir -WorldGuid $guid -NewVersion $newVersion | Out-Null
         $ws = Read-WorldState

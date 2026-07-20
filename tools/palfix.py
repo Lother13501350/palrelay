@@ -195,6 +195,92 @@ def set_entry_key_id(entry, new_id):
         key["value"] = new_id
 
 
+def verify_chain(world_dir, uid_dashed):
+    """Structural identity-chain check: player file -> character entry ->
+    guild reference -> containers. Returns (ok, report)."""
+    L = lib()
+    problems = []
+    report = {}
+    uid_hex = uid_dashed.replace("-", "").upper()
+    level_path = os.path.join(world_dir, "Level.sav")
+    player_path = os.path.join(world_dir, "Players", uid_hex + ".sav")
+    if not os.path.exists(player_path):
+        return False, {"ok": False, "problems": [f"player file missing: Players/{uid_hex}.sav"]}
+    if not os.path.exists(level_path):
+        return False, {"ok": False, "problems": ["Level.sav missing"]}
+
+    pj, _ = load_json(player_path)
+    sd = pj["properties"]["SaveData"]["value"]
+    file_uid = str(sd.get("PlayerUId", {}).get("value", "")).lower()
+    file_inst = str(sd["IndividualId"]["value"]["InstanceId"]["value"]).lower()
+    report["fileInstance"] = file_inst
+    if file_uid != uid_dashed:
+        problems.append(f"player file uid is {file_uid}, expected {uid_dashed}")
+
+    level_json, _ = load_json(level_path, L["conservative"])
+    wsd = wsd_of(level_json)
+    char_map = wsd.get("CharacterSaveParameterMap", {}).get("value", [])
+    mine = []
+    legacy = []
+    for e in char_map:
+        if not is_player_entry(e):
+            continue
+        e_uid = str(e["key"]["PlayerUId"]["value"]).lower()
+        if e_uid == uid_dashed:
+            mine.append(e)
+        elif e_uid == dashed(DEFAULT_OLD):
+            legacy.append(e)
+    if legacy:
+        problems.append("legacy co-op host entry (…0001) still present in Level.sav")
+    if len(mine) == 0:
+        problems.append(f"no character entry for {uid_dashed} in Level.sav")
+    elif len(mine) > 1:
+        insts = [str(e["key"]["InstanceId"]["value"]).lower()[:8] for e in mine]
+        problems.append(f"duplicate character entries for the same uid: {insts}")
+    match = None
+    for e in mine:
+        if str(e["key"]["InstanceId"]["value"]).lower() == file_inst:
+            match = e
+    if mine and match is None:
+        insts = [str(e["key"]["InstanceId"]["value"]).lower()[:8] for e in mine]
+        problems.append(
+            f"player file points at instance {file_inst[:8]} but entry instances are {insts}")
+    if match is not None:
+        sp = save_parameter(match)
+        report["nickname"] = sp.get("NickName", {}).get("value")
+        lvl = sp.get("Level", {}).get("value")
+        if isinstance(lvl, dict):
+            lvl = lvl.get("value")
+        report["level"] = lvl
+        raw = match.get("value", {}).get("RawData", {}).get("value")
+        group_id = str(raw.get("group_id", "")).lower() if isinstance(raw, dict) else ""
+        report["groupId"] = group_id
+        if group_id:
+            group_keys = {str(g.get("key", "")).lower()
+                          for g in wsd.get("GroupSaveDataMap", {}).get("value", [])}
+            if group_id not in group_keys:
+                problems.append(f"entry references guild {group_id[:8]} which does not exist (dangling)")
+            else:
+                report["guildFound"] = True
+
+    container_keys = set()
+    for section in ("ItemContainerSaveData", "CharacterContainerSaveData"):
+        for e in wsd.get(section, {}).get("value", []):
+            kid = entry_key_id(e)
+            if kid:
+                container_keys.add(kid)
+    wanted = list(collect_container_ids(sd).values())
+    missing = [c for c in wanted if c not in container_keys]
+    report["containersExpected"] = len(wanted)
+    report["containersFound"] = len(wanted) - len(missing)
+    if missing:
+        problems.append(f"{len(missing)} container(s) referenced by the player file are missing")
+
+    report["ok"] = not problems
+    report["problems"] = problems
+    return report["ok"], report
+
+
 # ------------------------------------------------------------- commands ----
 
 def cmd_meta(args):
@@ -430,6 +516,20 @@ def cmd_fix(args):
     shutil.copy2(level_path, level_path + ".palfix-bak")
     write_json(level_json, level_path, L["conservative"])
     os.rename(old_player_path, old_player_path + ".palfix-bak")
+
+    # --- 7. verify the identity chain; roll back automatically on failure ---
+    ok, vreport = verify_chain(world_dir, new_d)
+    stats["verify"] = vreport
+    if not ok:
+        shutil.copy2(level_path + ".palfix-bak", level_path)
+        os.rename(old_player_path + ".palfix-bak", old_player_path)
+        stats["ok"] = False
+        stats["rolledBack"] = True
+        stats["error"] = "post-fix verification failed, all changes rolled back: " + \
+            "; ".join(vreport.get("problems", []))
+        emit(stats)
+        sys.exit(1)
+
     stats["ok"] = True
     stats["oldGuid"] = old_d
     stats["newGuid"] = new_d
@@ -456,6 +556,10 @@ def main():
     p_fix.add_argument("--new-guid", required=True)
     p_fix.add_argument("--old-guid", default=DEFAULT_OLD)
 
+    p_verify = sub.add_parser("verify")
+    p_verify.add_argument("--dir", required=True)
+    p_verify.add_argument("--uid", required=True)
+
     args = ap.parse_args()
     setup_ooz(args.ooz_dll)
     sys.stdout = sys.stderr  # keep parser warnings off the JSON channel
@@ -468,6 +572,11 @@ def main():
             cmd_players(args)
         elif args.cmd == "fix":
             cmd_fix(args)
+        elif args.cmd == "verify":
+            ok, vreport = verify_chain(args.dir, dashed(args.uid))
+            emit(vreport)
+            if not ok:
+                sys.exit(1)
     except SystemExit:
         raise
     except Exception as e:
