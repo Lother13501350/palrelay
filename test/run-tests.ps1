@@ -247,6 +247,24 @@ $code = Cmd-Fixmap
 $restoredMap = Get-Content -Raw (Join-Path $clientWorld 'LocalData.sav')
 Assert ($code -eq 0 -and $restoredMap.Contains('big-map-data')) 'fixmap restores the largest known map data'
 
+# T12.8: session API (thin-frontend backend) ----------------------------------
+$env:PALRELAY_NO_SERVER = '1'
+Set-Content -Path (Join-Path $serverDir1 'PalServer.exe') -Value 'dummy'
+$Script:WorldName = 'main'
+$Script:Config.serverDir = $serverDir1
+$code = Cmd-SessionBegin
+Assert ($code -eq 0) 'session-begin succeeds'
+Assert ((Get-RemoteLock).holder -eq 'tester') 'session-begin holds the lock'
+Assert ((Read-WorldState).phase -eq 'hosting') 'session-begin sets hosting phase'
+$code = Cmd-SessionHeartbeat
+Assert ($code -eq 0) 'session-heartbeat updates our lock'
+$code = Cmd-SessionEnd
+Assert ($code -eq 0) 'session-end succeeds'
+Assert ($null -eq (Get-RemoteLock)) 'session-end releases the lock'
+$sess = Read-WorldState
+Assert ($sess.phase -eq 'idle' -and [int]$sess.lastDownloadedVersion -gt 5) 'session-end uploads and resets state'
+$env:PALRELAY_NO_SERVER = ''
+
 # T13: corrupted download is rejected -----------------------------------------
 $Script:WorldName = 'main'
 $Script:Config.serverDir = $serverDir3

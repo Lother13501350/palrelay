@@ -13,11 +13,16 @@
 
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('start', 'status', 'upload', 'takeover', 'worlds', 'import', 'fixhost', 'fixmap', 'init', 'help')]
+    [ValidateSet('start', 'status', 'upload', 'takeover', 'worlds', 'import', 'fixhost', 'fixmap', 'init', 'help',
+                 'session-begin', 'session-heartbeat', 'session-end', 'list-coop')]
     [string]$Command = 'help',
     [Parameter(Position = 1)]
     [string]$World = '',
-    [switch]$Force
+    [switch]$Force,
+    [switch]$Json,       # machine-readable mode: one JSON line on stdout, logs on stderr
+    [switch]$Yes,        # assume-yes for confirmations (non-interactive callers)
+    [string]$NewGuid = '',   # fixhost: preselected new character guid
+    [string]$Source = ''     # import: co-op world folder path (non-interactive)
 )
 
 $ErrorActionPreference = 'Stop'
@@ -26,7 +31,7 @@ $ErrorActionPreference = 'Stop'
 # non-ASCII world names get mangled on CJK-codepage consoles.
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
 
-$Script:ToolVersion = '0.5.0'
+$Script:ToolVersion = '0.6.0'
 $Script:ToolDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Script:StateFile = Join-Path $Script:ToolDir 'state.json'
 $Script:BackupRoot = Join-Path $Script:ToolDir 'backups'
@@ -38,6 +43,12 @@ $Script:GroupConfig = $null
 $Script:GroupConfigLoaded = $false
 $Script:CoopSaveRoot = $null
 $Script:ClientSaveRoot = $null
+$Script:JsonMode = $false
+$Script:AssumeYes = $false
+
+function Emit-Json($Obj) {
+    [Console]::Out.WriteLine((ConvertTo-Json $Obj -Compress -Depth 8))
+}
 # libooz.dll (Oodle decompressor for the PlM save format) is fetched on demand
 # from the upstream zao/ooz release; it is NOT redistributed with PalRelay
 # because zao/ooz carries no explicit license.
@@ -671,6 +682,7 @@ function Cmd-Fixmap {
         }
     }
     if (-not $restored) { Write-Info 'Map data is already at its best known state - nothing to restore.' }
+    if ($Script:JsonMode) { Emit-Json @{ ok = $true; restored = $restored } }
     return 0
 }
 
@@ -712,6 +724,7 @@ function Invoke-ServerApi {
 }
 
 function Start-Server {
+    if ($env:PALRELAY_NO_SERVER -eq '1') { return $null }  # offline tests only
     $cfg = $Script:Config
     $exe = Join-Path $cfg.serverDir $cfg.serverExe
     $procArgs = @($cfg.serverArgs)
@@ -931,6 +944,10 @@ function Cmd-Status {
     $lock = Get-RemoteLock
     $latest = Get-RemoteJson (Get-WorldPath 'latest.json')
     $state = Read-WorldState
+    if ($Script:JsonMode) {
+        Emit-Json @{ ok = $true; world = $Script:WorldName; lock = $lock; latest = $latest; state = $state }
+        return 0
+    }
     Write-Host ('--- PalRelay status: world "' + $Script:WorldName + '" ---')
     if ($lock) {
         $staleTag = ''
@@ -957,26 +974,35 @@ function Cmd-Status {
 
 function Cmd-Worlds {
     $worlds = Get-CloudWorlds
-    if ($worlds.Count -eq 0) {
+    if ($worlds.Count -eq 0 -and -not $Script:JsonMode) {
         Write-Host 'No worlds yet. Create one with: .\palrelay.ps1 start <name>'
         return 0
     }
-    Write-Host '--- PalRelay worlds ---'
     $saved = $Script:WorldName
+    $items = @()
     foreach ($w in $worlds) {
+        if (-not $w) { continue }
         $Script:WorldName = $w
         $lock = Get-RemoteLock
         $latest = Get-RemoteJson (Get-WorldPath 'latest.json')
-        $status = 'free'
-        if ($lock) {
-            if (Test-LockStale $lock) { $status = ('STALE lock ({0})' -f $lock.holder) }
-            else { $status = ('hosted by {0}' -f $lock.holder) }
-        }
-        $ver = 'no saves'
-        if ($latest) { $ver = ('v{0} by {1} at {2}' -f $latest.version, $latest.uploadedBy, $latest.uploadedUtc) }
-        Write-Host ('  {0,-20} {1,-25} {2}' -f $w, $status, $ver)
+        $items += [pscustomobject]@{ name = $w; lock = $lock; latest = $latest }
     }
     $Script:WorldName = $saved
+    if ($Script:JsonMode) {
+        Emit-Json @{ ok = $true; worlds = $items }
+        return 0
+    }
+    Write-Host '--- PalRelay worlds ---'
+    foreach ($it in $items) {
+        $status = 'free'
+        if ($it.lock) {
+            if (Test-LockStale $it.lock) { $status = ('STALE lock ({0})' -f $it.lock.holder) }
+            else { $status = ('hosted by {0}' -f $it.lock.holder) }
+        }
+        $ver = 'no saves'
+        if ($it.latest) { $ver = ('v{0} by {1} at {2}' -f $it.latest.version, $it.latest.uploadedBy, $it.latest.uploadedUtc) }
+        Write-Host ('  {0,-20} {1,-25} {2}' -f $it.name, $status, $ver)
+    }
     return 0
 }
 
@@ -1117,6 +1143,22 @@ function Import-CoopWorld {
 }
 
 function Cmd-Import {
+    if ($Source) {
+        # non-interactive path for GUIs: -Source <coop path> <world name>
+        if (-not $World) {
+            if ($Script:JsonMode) { Emit-Json @{ ok = $false; reason = 'world-name-required' } }
+            Write-Err 'Provide the target world name as the second argument.'
+            return 3
+        }
+        if ($World -match '[\\/:*?"<>|]') {
+            if ($Script:JsonMode) { Emit-Json @{ ok = $false; reason = 'invalid-world-name' } }
+            Write-Err 'Names must not contain \ / : * ? " < > |'
+            return 3
+        }
+        Import-CoopWorld -SourceDir $Source -TargetWorld $World
+        if ($Script:JsonMode) { Emit-Json @{ ok = $true; world = $World } }
+        return 0
+    }
     $coop = Find-CoopWorlds
     if ($coop.Count -eq 0) {
         Write-Err 'No co-op worlds found under %LOCALAPPDATA%\Pal\Saved\SaveGames.'
@@ -1184,11 +1226,23 @@ function Cmd-Fixhost {
     $candidates = @(Get-ChildItem -Path $pdir -Filter '*.sav' |
         ForEach-Object { $_.BaseName.ToUpper() } |
         Where-Object { $known -notcontains $_ })
-    $newGuid = $null
-    if ($candidates.Count -eq 1) {
-        $newGuid = $candidates[0]
+    $targetGuid = $null
+    if ($NewGuid) {
+        $sel = $NewGuid.Replace('-', '').ToUpper()
+        if ($candidates -contains $sel) { $targetGuid = $sel }
+        else {
+            if ($Script:JsonMode) { Emit-Json @{ ok = $false; reason = 'invalid-guid'; candidates = $candidates } }
+            Write-Err 'The provided guid is not among the candidate character files.'
+            return 3
+        }
+    } elseif ($candidates.Count -eq 1) {
+        $targetGuid = $candidates[0]
     } elseif ($candidates.Count -eq 0) {
+        if ($Script:JsonMode) { Emit-Json @{ ok = $false; reason = 'no-new-character' } }
         Write-Err 'No new character file found. The original host must join the server once and create a character first.'
+        return 3
+    } elseif ($Script:JsonMode) {
+        Emit-Json @{ ok = $false; reason = 'ambiguous'; candidates = $candidates }
         return 3
     } else {
         Write-Host 'Several candidate character files:'
@@ -1199,16 +1253,16 @@ function Cmd-Fixhost {
             Write-Err 'Invalid choice.'
             return 3
         }
-        $newGuid = $candidates[$idx - 1]
+        $targetGuid = $candidates[$idx - 1]
     }
-    Write-Info ('Migrating the host character onto {0}...' -f $newGuid)
+    Write-Info ('Migrating the host character onto {0}...' -f $targetGuid)
     if (-not (Confirm-Prompt 'This edits the world save (backups kept, cloud untouched until success). Continue?' $true)) {
         return 2
     }
     $myLock = Acquire-Lock
     try {
         $dll = Join-Path $Script:ToolDir 'tools\libooz.dll'
-        $result = Invoke-Palfix @('--ooz-dll', $dll, 'fix', '--dir', $worldDir, '--new-guid', $newGuid)
+        $result = Invoke-Palfix @('--ooz-dll', $dll, 'fix', '--dir', $worldDir, '--new-guid', $targetGuid)
         Write-Info ('Character migrated. Pals re-keyed: {0}, owners fixed: {1}, container slots: {2}.' -f `
             $result.palsRekeyed, $result.ownerFixed, $result.containerSlotsFixed)
         if ($result.PSObject.Properties['verify'] -and $result.verify.ok) {
@@ -1223,8 +1277,8 @@ function Cmd-Fixhost {
         $ws.hostingStartedUtc = ''
         Write-WorldState $ws
         Release-Lock $myLock
+        if ($Script:JsonMode) { Emit-Json @{ ok = $true; version = $newVersion; verify = $result.verify } }
         Write-Info ('Done! Uploaded v{0}. The host gets their original character next session.' -f $newVersion)
-        Write-Info 'NOTE: appearance stays as the newly created character (adjust in-game with the antique mirror).'
         Write-Info 'NOTE: the host starts in a personal guild - have a friend re-invite them to the group guild in-game.'
         return 0
     } catch {
@@ -1237,6 +1291,127 @@ function Cmd-Fixhost {
         Write-Warn 'Local copy may be half-modified; it will be re-downloaded from the cloud next session.'
         return 1
     }
+}
+
+# ------------------------------------------------- session API (for GUIs) ---
+# Decomposes the hosting lifecycle into non-interactive steps so a frontend
+# can drive it while ALL protocol logic stays in this file.
+
+function Cmd-SessionBegin {
+    Test-Prereqs
+    $state = Read-WorldState
+    $recovered = $false
+    if ($state.phase -eq 'hosting') {
+        Write-Warn 'Previous session did not upload; uploading local save first.'
+        if ((Cmd-Upload) -ne 0) {
+            if ($Script:JsonMode) { Emit-Json @{ ok = $false; reason = 'recovery-upload-failed' } }
+            return 1
+        }
+        $recovered = $true
+    }
+    $lock = Get-RemoteLock
+    $stale = $false
+    if ($lock -and -not (Test-LockOurs $lock)) {
+        if (-not (Test-LockStale $lock)) {
+            if ($Script:JsonMode) {
+                Emit-Json @{ ok = $false; reason = 'locked'; holder = $lock.holder; machine = $lock.machine; startedUtc = $lock.startedUtc; heartbeatUtc = $lock.heartbeatUtc }
+            } else {
+                Write-Err ('World is hosted by {0}.' -f $lock.holder)
+            }
+            return 2
+        }
+        if (-not $Force) {
+            if ($Script:JsonMode) {
+                Emit-Json @{ ok = $false; reason = 'stale-lock'; holder = $lock.holder; heartbeatUtc = $lock.heartbeatUtc }
+            } else {
+                Write-Err 'Stale lock present; rerun with -Force to take over.'
+            }
+            return 2
+        }
+        $stale = $true
+    }
+    if ($stale) { $myLock = Acquire-Lock -AllowStaleTakeover } else { $myLock = Acquire-Lock }
+    try {
+        $latest = Get-RemoteJson (Get-WorldPath 'latest.json')
+        Sync-Down $latest
+        $guid = Resolve-WorldGuid $latest
+        if ($guid) {
+            Ensure-DedicatedServerName $guid
+            Protect-ClientMapData $guid
+        }
+        $base = 0
+        if ($latest) { $base = [int]$latest.version }
+        $ws = Read-WorldState
+        $ws.phase = 'hosting'
+        $ws.hostingStartedUtc = (Now-Iso)
+        Write-WorldState $ws
+        $null = Start-Server
+        if ($Script:JsonMode) {
+            Emit-Json @{
+                ok = $true; world = $Script:WorldName; baseVersion = $base; worldGuid = $guid
+                hostIp = $myLock.hostIp; hostIpSource = $myLock.hostIpSource; serverPort = $myLock.serverPort
+                recoveredUpload = $recovered
+            }
+        }
+        Write-Info ('Session started for world "{0}".' -f $Script:WorldName)
+        return 0
+    } catch {
+        Release-Lock $myLock
+        throw
+    }
+}
+
+function Cmd-SessionHeartbeat {
+    $lock = Get-RemoteLock
+    if ($lock -and (Test-LockOurs $lock)) {
+        $Script:CurrentLock = $lock
+        $Script:CurrentLock.heartbeatUtc = (Now-Iso)
+        Put-RemoteJson (Get-WorldPath 'lock.json') $Script:CurrentLock
+        if ($Script:JsonMode) { Emit-Json @{ ok = $true } }
+        return 0
+    }
+    if ($Script:JsonMode) { Emit-Json @{ ok = $false; reason = 'lock-not-ours' } }
+    Write-Warn 'Heartbeat skipped: the remote lock is not ours.'
+    return 2
+}
+
+function Cmd-SessionEnd {
+    $lock = Get-RemoteLock
+    $null = Stop-ServerGraceful $null
+    $latest = Get-RemoteJson (Get-WorldPath 'latest.json')
+    $guid = Resolve-WorldGuid $latest
+    if (-not $guid) {
+        if ($Script:JsonMode) { Emit-Json @{ ok = $false; reason = 'world-folder-missing' } }
+        Write-Err 'Could not find the world folder to upload.'
+        return 1
+    }
+    $base = 0
+    if ($latest) { $base = [int]$latest.version }
+    $newVersion = $base + 1
+    Publish-Save -SourceDir (Join-Path (Get-SaveRoot) $guid) -WorldGuid $guid -NewVersion $newVersion | Out-Null
+    $ws = Read-WorldState
+    $ws.phase = 'idle'
+    $ws.lastDownloadedVersion = $newVersion
+    $ws.hostingStartedUtc = ''
+    Write-WorldState $ws
+    if ($lock -and (Test-LockOurs $lock)) { Release-Lock $lock }
+    if ($Script:JsonMode) { Emit-Json @{ ok = $true; version = $newVersion } }
+    Write-Info ('Session ended; uploaded v{0}.' -f $newVersion)
+    return 0
+}
+
+function Cmd-ListCoop {
+    $list = @()
+    foreach ($w in Find-CoopWorlds) {
+        if (-not $w) { continue }
+        $list += @{
+            path = $w.Path; guid = $w.Guid
+            modified = $w.Modified.ToString('o')
+            name = (Get-CoopWorldName $w.Path)
+        }
+    }
+    Emit-Json @{ ok = $true; worlds = $list }
+    return 0
 }
 
 function Cmd-Init {
@@ -1302,33 +1477,50 @@ function Cmd-Takeover {
 
 function Main {
     param([string]$Cmd, [string]$WorldArg)
+    $Script:JsonMode = [bool]$Json
+    $Script:AssumeYes = [bool]$Yes
+    if ($Script:JsonMode) {
+        # machine mode: stdout carries exactly one JSON line; logs go to stderr
+        function Script:Write-Info([string]$m) { [Console]::Error.WriteLine('[info] ' + $m) }
+        function Script:Write-Warn([string]$m) { [Console]::Error.WriteLine('[warn] ' + $m) }
+        function Script:Write-Err([string]$m)  { [Console]::Error.WriteLine('[error] ' + $m) }
+        function Script:Confirm-Prompt { param([string]$Message, [bool]$DefaultYes) if ($Script:AssumeYes) { return $true } return $DefaultYes }
+    } elseif ($Script:AssumeYes) {
+        function Script:Confirm-Prompt { param([string]$Message, [bool]$DefaultYes) return $true }
+    }
     if ($Cmd -eq 'help') { $null = Show-Help; exit 0 }
     if ($Cmd -eq 'init') { exit (Cmd-Init) }
     try {
         $Script:Config = Read-Config
     } catch {
+        if ($Script:JsonMode) { Emit-Json @{ ok = $false; reason = 'config'; error = $_.Exception.Message } }
         Write-Err $_.Exception.Message
         exit 3
     }
     $code = 1
     try {
         Ensure-CloudLayout
-        if ($Cmd -eq 'worlds') {
-            $code = Cmd-Worlds
-        } elseif ($Cmd -eq 'import') {
-            $code = Cmd-Import
-        } else {
-            $Script:WorldName = Resolve-WorldName $WorldArg
-            switch ($Cmd) {
-                'start'    { $code = Cmd-Start }
-                'status'   { $code = Cmd-Status }
-                'upload'   { $code = Cmd-Upload }
-                'takeover' { $code = Cmd-Takeover }
-                'fixhost'  { $code = Cmd-Fixhost }
-                'fixmap'   { $code = Cmd-Fixmap }
+        switch ($Cmd) {
+            'worlds'    { $code = Cmd-Worlds }
+            'import'    { $code = Cmd-Import }
+            'list-coop' { $code = Cmd-ListCoop }
+            default {
+                $Script:WorldName = Resolve-WorldName $WorldArg
+                switch ($Cmd) {
+                    'start'             { $code = Cmd-Start }
+                    'status'            { $code = Cmd-Status }
+                    'upload'            { $code = Cmd-Upload }
+                    'takeover'          { $code = Cmd-Takeover }
+                    'fixhost'           { $code = Cmd-Fixhost }
+                    'fixmap'            { $code = Cmd-Fixmap }
+                    'session-begin'     { $code = Cmd-SessionBegin }
+                    'session-heartbeat' { $code = Cmd-SessionHeartbeat }
+                    'session-end'       { $code = Cmd-SessionEnd }
+                }
             }
         }
     } catch {
+        if ($Script:JsonMode) { Emit-Json @{ ok = $false; error = $_.Exception.Message } }
         Write-Err $_.Exception.Message
         $code = 1
     }

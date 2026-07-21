@@ -56,7 +56,7 @@
 
 1. 於 [Releases](https://github.com/Lother13501350/palrelay/releases/latest) 下載最新 zip 並解壓縮
 2. 雙擊 `setup.cmd`,選擇「**1 加入朋友的群組**」,貼上群主提供的共用資料夾連結,依精靈指示完成(約 3 分鐘)
-3. 完成後以 `palrelay-gui.cmd` 開啟主介面
+3. 完成後以 **`PalRelay.exe`** 開啟主介面
 
 ### 群主(建立新群組)
 
@@ -68,7 +68,8 @@
 
 ## 日常使用
 
-1. 開啟 `palrelay-gui.cmd` → 選擇世界 → 按「**開始當主機**」
+1. 開啟 **`PalRelay.exe`** → 選擇世界 → 按「**開始當主機**」
+   (原生應用,免安裝任何執行環境;舊的 `palrelay-gui.cmd` 為備用入口)
 2. 介面顯示連線位址(一鍵複製),貼到群組;成員於遊戲「加入多人遊戲」最下方輸入位址連線
 3. 收工按「**收工上傳**」:自動存檔、關閉伺服器、上傳雲端、釋放鎖
 
@@ -164,8 +165,9 @@ host 開服時自動套用**)與**地圖探索資料**(自動備份;若遊戲重
 
 | 路徑 | 內容 |
 |---|---|
-| `palrelay.ps1` | 核心 CLI(純 PowerShell 5.1,ASCII) |
-| `palrelay-gui.ps1` | WPF 圖形介面(dot-source 重用核心) |
+| `palrelay.ps1` | 核心 CLI(純 PowerShell 5.1,ASCII;`-Json` 供前端呼叫) |
+| `gui/` | 原生 GUI(C# WPF,.NET 9 自包含單檔;呼叫 CLI 的 session API,協議單一來源) |
+| `palrelay-gui.ps1` | 舊版 PowerShell GUI(備用) |
 | `setup.ps1` | 安裝精靈 |
 | `tools/palfix.py` | 存檔搬遷引擎(CI 以 PyInstaller 打包為 exe) |
 | `test/` | 測試套件與 fake-rclone |
