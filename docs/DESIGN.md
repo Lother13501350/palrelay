@@ -334,7 +334,18 @@ Exit codes:`0` 成功 / `1` 一般錯誤 / `2` 鎖被他人持有 / `3` 設定�
   非零碼結束。`palfix verify --dir <world> --uid <hex32>` 可隨時獨立診斷
 - 明確不做:改寫 Players/*.sav(伺服器會拒收)、手改公會成員名單
   (新格式為 ASCII hex 字串 + 未知結構;公會異動交給遊戲內操作)
-- 一次性代價:外觀維持新角色(遊戲內鏡子可改)、公會需遊戲內重邀
+- **進度移植**:fix 同時把玩家檔中的進度欄位(TechnologyPoint、
+  UnlockedRecipeTechnologyNames、任務陣列、RecordData(含傳送點解鎖與圖鑑)、
+  PlayerCharacterMakeData 外觀)從舊檔移植到伺服器建立的新檔——身分與容器
+  引用欄位保持新檔原樣(實測伺服器接受此類改寫)
+- **世界設定跟隨世界**:import 以 `palfix options` 解出 WorldOption.sav 的
+  遊戲性設定(排除 REST/密碼等運維鍵)存為雲端 `worlds/<name>/options.json`;
+  每次 `start` 時 Ensure-ServerSettings 將其合併進該主機的 PalWorldSettings.ini
+  再疊加 REST/密碼強制值
+- **地圖資料保護**:客戶端每世界的 LocalData.sav(探索迷霧)可能在連線
+  dedicated server 時被遊戲重置;start/import 時自動以最大檔備份
+  (`.palrelay-bak`),`fixmap` 指令從備份或世界資料夾副本擇大還原
+- 一次性代價:公會需遊戲內重邀(新版公會結構不可安全手改)
 - 訪客玩家的角色 GUID 在 co-op 與 dedicated 相同,毋須處理
 
 ## 13. 測試策略

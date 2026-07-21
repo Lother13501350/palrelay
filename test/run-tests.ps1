@@ -211,6 +211,41 @@ Assert ($importedLatest.worldGuid -eq $coopGuid) 'import records source guid'
 $iws = Read-WorldState
 Assert (@($iws.importPlayers).Count -eq 2) 'import records pre-existing player files'
 Assert-Throws { Import-CoopWorld -SourceDir $found[0].Path -TargetWorld 'imported' } 'import refuses duplicate world name'
+$Script:WorldName = 'imported'
+Assert ($null -eq (Get-RemoteJson (Get-WorldPath 'options.json'))) 'import without valid WorldOption skips options gracefully'
+$Script:WorldName = 'main'
+
+# T12.5: option overrides merge ------------------------------------------------
+$iniSample = 'OptionSettings=(Difficulty=None,ExpRate=1.000000,WorkSpeedRate=1.000000,RESTAPIEnabled=False,AdminPassword="x")'
+$ovTest = [pscustomobject]@{ ExpRate = '3.000000'; WorkSpeedRate = '2.500000'; NotInIni = '9' }
+$mres = Merge-OptionOverrides -IniContent $iniSample -Overrides $ovTest
+Assert ($mres.Changed -eq 2) 'merge changes only matching keys'
+Assert ($mres.Content.Contains('ExpRate=3.000000') -and $mres.Content.Contains('WorkSpeedRate=2.500000')) 'merge applies values'
+Assert ($mres.Content.Contains('RESTAPIEnabled=False')) 'merge leaves non-override keys alone'
+
+# T12.6: world settings follow the world (cloud options -> ini) ---------------
+$Script:Config.serverDir = $serverDir1
+Set-Content -Path (Join-Path $serverDir1 'DefaultPalWorldSettings.ini') -Value 'OptionSettings=(Difficulty=None,ExpRate=1.000000,RESTAPIEnabled=False,RESTAPIPort=8212,AdminPassword="")'
+Put-RemoteJson (Get-WorldPath 'options.json') ([pscustomobject]@{ schemaVersion = 1; optionOverrides = [pscustomobject]@{ ExpRate = '3.000000' } })
+Ensure-ServerSettings
+$iniOut = Get-Content -Raw (Join-Path $serverDir1 'Pal\Saved\Config\WindowsServer\PalWorldSettings.ini')
+Assert ($iniOut.Contains('ExpRate=3.000000')) 'cloud world settings applied to ini'
+Assert ($iniOut.Contains('RESTAPIEnabled=True')) 'REST enforcement still applied on top'
+Assert ($iniOut.Contains('AdminPassword="group-pw-123"')) 'admin password still applied on top'
+
+# T12.7: client map protect + fixmap ------------------------------------------
+function Test-GameClientRunning { return $false }
+$clientRoot = Join-Path $work 'ClientSaves'
+$Script:ClientSaveRoot = $clientRoot
+$clientWorld = Join-Path $clientRoot "7656000099998888\$guid"
+New-Item -ItemType Directory -Path $clientWorld -Force | Out-Null
+Set-Content -Path (Join-Path $clientWorld 'LocalData.sav') -Value 'small'
+Protect-ClientMapData $guid
+Assert (Test-Path (Join-Path $clientWorld 'LocalData.sav.palrelay-bak')) 'protect creates map backup'
+Set-Content -Path (Join-Path $saveRoot1 "$guid\LocalData.sav") -Value ('big-map-data-' + ('x' * 500))
+$code = Cmd-Fixmap
+$restoredMap = Get-Content -Raw (Join-Path $clientWorld 'LocalData.sav')
+Assert ($code -eq 0 -and $restoredMap.Contains('big-map-data')) 'fixmap restores the largest known map data'
 
 # T13: corrupted download is rejected -----------------------------------------
 $Script:WorldName = 'main'

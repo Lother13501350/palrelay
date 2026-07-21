@@ -13,7 +13,7 @@
 
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('start', 'status', 'upload', 'takeover', 'worlds', 'import', 'fixhost', 'init', 'help')]
+    [ValidateSet('start', 'status', 'upload', 'takeover', 'worlds', 'import', 'fixhost', 'fixmap', 'init', 'help')]
     [string]$Command = 'help',
     [Parameter(Position = 1)]
     [string]$World = '',
@@ -26,7 +26,7 @@ $ErrorActionPreference = 'Stop'
 # non-ASCII world names get mangled on CJK-codepage consoles.
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
 
-$Script:ToolVersion = '0.4.1'
+$Script:ToolVersion = '0.5.0'
 $Script:ToolDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Script:StateFile = Join-Path $Script:ToolDir 'state.json'
 $Script:BackupRoot = Join-Path $Script:ToolDir 'backups'
@@ -37,6 +37,7 @@ $Script:WorldName = ''
 $Script:GroupConfig = $null
 $Script:GroupConfigLoaded = $false
 $Script:CoopSaveRoot = $null
+$Script:ClientSaveRoot = $null
 # libooz.dll (Oodle decompressor for the PlM save format) is fetched on demand
 # from the upstream zao/ooz release; it is NOT redistributed with PalRelay
 # because zao/ooz carries no explicit license.
@@ -543,39 +544,134 @@ function Test-Prereqs {
     Ensure-ServerSettings
 }
 
-function Ensure-ServerSettings {
-    # Self-provisions PalWorldSettings.ini (REST API on, admin password from
-    # group.json/config.json) so graceful shutdown always works. Running inside
-    # the host user's own session guarantees the file is visible to the server.
-    $cfg = $Script:Config
-    $adminPw = Get-AdminPassword
-    if (-not $adminPw) {
-        Write-Warn 'No adminPassword found (group.json or config.json) - REST shutdown will not work.'
-        return
+function Merge-OptionOverrides {
+    # Applies key=value overrides inside the ini's OptionSettings=(...) line.
+    param([string]$IniContent, $Overrides)
+    $changed = 0
+    foreach ($p in $Overrides.PSObject.Properties) {
+        $pattern = '([(,]' + [regex]::Escape($p.Name) + '=)[^,)]*'
+        $m = [regex]::Match($IniContent, $pattern)
+        if (-not $m.Success) { continue }
+        $valueStart = $m.Groups[1].Index + $m.Groups[1].Length
+        $current = $IniContent.Substring($valueStart, $m.Index + $m.Length - $valueStart)
+        $wanted = [string]$p.Value
+        if ($current -ne $wanted) {
+            $IniContent = $IniContent.Substring(0, $valueStart) + $wanted + $IniContent.Substring($m.Index + $m.Length)
+            $changed++
+        }
     }
+    return [pscustomobject]@{ Content = $IniContent; Changed = $changed }
+}
+
+function Ensure-ServerSettings {
+    # Self-provisions PalWorldSettings.ini: world gameplay settings follow the
+    # world (cloud options.json, captured at import), then REST API and admin
+    # password are enforced on top. Runs in the host user's own session, so
+    # the file is always visible to the server process.
+    $cfg = $Script:Config
     $iniDir = Join-Path $cfg.serverDir 'Pal\Saved\Config\WindowsServer'
     $ini = Join-Path $iniDir 'PalWorldSettings.ini'
     $base = ''
     if (Test-Path $ini) { $base = Get-Content -Raw -Path $ini }
-    $wantPw = 'AdminPassword="' + $adminPw + '"'
-    $wantPort = 'RESTAPIPort=' + $cfg.restPort
-    if ($base.Contains('RESTAPIEnabled=True') -and $base.Contains($wantPw) -and $base.Contains($wantPort)) {
-        return
-    }
     if ($base -notmatch 'OptionSettings=\(') {
         $default = Join-Path $cfg.serverDir 'DefaultPalWorldSettings.ini'
         if (-not (Test-Path $default)) {
-            Write-Warn 'No usable PalWorldSettings.ini and no DefaultPalWorldSettings.ini; cannot configure the REST API.'
+            Write-Warn 'No usable PalWorldSettings.ini and no DefaultPalWorldSettings.ini; cannot configure the server.'
             return
         }
         $base = Get-Content -Raw -Path $default
     }
-    $base = [regex]::Replace($base, 'AdminPassword="[^"]*"', $wantPw)
-    $base = [regex]::Replace($base, 'RESTAPIEnabled=(True|False)', 'RESTAPIEnabled=True')
-    $base = [regex]::Replace($base, 'RESTAPIPort=\d+', $wantPort)
-    if (-not (Test-Path $iniDir)) { New-Item -ItemType Directory -Path $iniDir -Force | Out-Null }
-    [IO.File]::WriteAllText($ini, $base)
-    Write-Info 'PalWorldSettings.ini configured (REST API enabled, admin password applied).'
+    $orig = $base
+    if ($Script:WorldName) {
+        $opt = Get-RemoteJson (Get-WorldPath 'options.json')
+        if ($opt -and $opt.PSObject.Properties['optionOverrides']) {
+            $res = Merge-OptionOverrides -IniContent $base -Overrides $opt.optionOverrides
+            $base = $res.Content
+            if ($res.Changed -gt 0) {
+                Write-Info ('World settings applied from the cloud ({0} values, e.g. rates follow the world).' -f $res.Changed)
+            }
+        }
+    }
+    $adminPw = Get-AdminPassword
+    if (-not $adminPw) {
+        Write-Warn 'No adminPassword found (group.json or config.json) - REST shutdown will not work.'
+    } else {
+        $base = [regex]::Replace($base, 'AdminPassword="[^"]*"', ('AdminPassword="' + $adminPw + '"'))
+        $base = [regex]::Replace($base, 'RESTAPIEnabled=(True|False)', 'RESTAPIEnabled=True')
+        $base = [regex]::Replace($base, 'RESTAPIPort=\d+', ('RESTAPIPort=' + $cfg.restPort))
+    }
+    if ($base -ne $orig -or -not (Test-Path $ini)) {
+        if (-not (Test-Path $iniDir)) { New-Item -ItemType Directory -Path $iniDir -Force | Out-Null }
+        [IO.File]::WriteAllText($ini, $base)
+        Write-Info 'PalWorldSettings.ini updated.'
+    }
+}
+
+function Get-ClientWorldDirs([string]$Guid) {
+    # The game keeps per-world CLIENT data (map fog/exploration) under the
+    # player's local appdata; joining a dedicated server can reset it.
+    $root = $Script:ClientSaveRoot
+    if (-not $root) { $root = Join-Path $env:LOCALAPPDATA 'Pal\Saved\SaveGames' }
+    $dirs = @()
+    if (Test-Path $root) {
+        foreach ($acct in Get-ChildItem -Path $root -Directory) {
+            $d = Join-Path $acct.FullName $Guid
+            if (Test-Path $d) { $dirs += $d }
+        }
+    }
+    return ,@($dirs)
+}
+
+function Protect-ClientMapData([string]$Guid) {
+    # Seatbelt: keep the largest-known LocalData.sav as a .palrelay-bak.
+    foreach ($d in Get-ClientWorldDirs $Guid) {
+        if (-not $d) { continue }
+        $ld = Join-Path $d 'LocalData.sav'
+        if (Test-Path $ld) {
+            $bak = $ld + '.palrelay-bak'
+            if (-not (Test-Path $bak) -or (Get-Item $ld).Length -gt (Get-Item $bak).Length) {
+                Copy-Item $ld $bak -Force
+            }
+        }
+    }
+}
+
+function Test-GameClientRunning {
+    return [bool](Get-Process -Name 'Palworld*' -ErrorAction SilentlyContinue)
+}
+
+function Cmd-Fixmap {
+    if (Test-GameClientRunning) {
+        Write-Err 'Close the Palworld game client first, then rerun fixmap.'
+        return 3
+    }
+    $latest = Get-RemoteJson (Get-WorldPath 'latest.json')
+    $guid = Resolve-WorldGuid $latest
+    if (-not $guid) {
+        Write-Err 'Could not determine the world folder for this world.'
+        return 3
+    }
+    $serverCopy = Join-Path (Join-Path (Get-SaveRoot) $guid) 'LocalData.sav'
+    $restored = $false
+    foreach ($d in Get-ClientWorldDirs $guid) {
+        if (-not $d) { continue }
+        $ld = Join-Path $d 'LocalData.sav'
+        $candidates = @()
+        if (Test-Path ($ld + '.palrelay-bak')) { $candidates += Get-Item ($ld + '.palrelay-bak') }
+        if (Test-Path $serverCopy) { $candidates += Get-Item $serverCopy }
+        if ($candidates.Count -eq 0) { continue }
+        $best = $candidates | Sort-Object Length -Descending | Select-Object -First 1
+        $curLen = 0
+        if (Test-Path $ld) { $curLen = (Get-Item $ld).Length }
+        if ($best.Length -gt $curLen) {
+            if (Test-Path $ld) { Copy-Item $ld ($ld + '.before-fixmap') -Force }
+            Copy-Item $best.FullName $ld -Force
+            Write-Info ('Map data restored ({0} -> {1} bytes): {2}' -f $curLen, $best.Length, $d)
+            $restored = $true
+        }
+    }
+    if (-not $restored) { Write-Info 'Map data is already at its best known state - nothing to restore.' }
+    return 0
 }
 
 function Ensure-DedicatedServerName([string]$WorldGuid) {
@@ -742,7 +838,10 @@ function Cmd-Start {
         $latest = Get-RemoteJson (Get-WorldPath 'latest.json')
         Sync-Down $latest
         $guid = Resolve-WorldGuid $latest
-        if ($guid) { Ensure-DedicatedServerName $guid }
+        if ($guid) {
+            Ensure-DedicatedServerName $guid
+            Protect-ClientMapData $guid
+        }
         else { Write-Warn 'No existing world found - the server will create a new one on first launch.' }
 
         $baseVersion = 0
@@ -977,9 +1076,21 @@ function Import-CoopWorld {
     Copy-Item -Path $SourceDir -Destination $saveRoot -Recurse
     Remove-Item (Join-Path $target 'backup') -Recurse -Force -ErrorAction SilentlyContinue
     $wo = Join-Path $target 'WorldOption.sav'
+    $Script:PendingImportOptions = $null
     if (Test-Path $wo) {
+        if (Get-PalfixPath) {
+            $null = Ensure-OozDll -Quiet
+            try {
+                $optResult = Invoke-Palfix @('options', '--world-option', $wo)
+                if ($optResult.optionOverrides) { $Script:PendingImportOptions = $optResult.optionOverrides }
+                Write-Info 'World settings (rates, difficulty...) extracted; they will follow the world in the cloud.'
+            } catch {
+                Write-Warn ('Could not extract world settings: ' + $_.Exception.Message)
+            }
+        } else {
+            Write-Warn 'tools\palfix.exe missing - world settings (rates) cannot be preserved.'
+        }
         Remove-Item $wo -Force
-        Write-Info 'Removed WorldOption.sav so server settings come from PalWorldSettings.ini.'
     }
     $Script:WorldName = $TargetWorld
     Ensure-DedicatedServerName $guid
@@ -989,6 +1100,14 @@ function Import-CoopWorld {
         $preexisting = @(Get-ChildItem -Path $pdir -Filter '*.sav' | ForEach-Object { $_.BaseName.ToUpper() })
     }
     $null = Publish-Save -SourceDir $target -WorldGuid $guid -NewVersion 1
+    if ($Script:PendingImportOptions) {
+        Put-RemoteJson (Get-WorldPath 'options.json') ([pscustomobject]@{
+            schemaVersion   = 1
+            optionOverrides = $Script:PendingImportOptions
+        })
+        Write-Info 'World settings uploaded - every future host applies them automatically.'
+    }
+    Protect-ClientMapData $guid
     $ws = Read-WorldState
     $ws.phase = 'idle'
     $ws.lastDownloadedVersion = 1
@@ -1147,6 +1266,7 @@ Commands:
   takeover [world]  Remove a stale lock left behind by a crashed host.
   import            Import an existing co-op world from the local game saves.
   fixhost [world]   Migrate the co-op host character after the first join.
+  fixmap [world]    Restore client-side map exploration if the game reset it.
   init              Create config.json from config.sample.json.
   help              Show this help.
 
@@ -1205,6 +1325,7 @@ function Main {
                 'upload'   { $code = Cmd-Upload }
                 'takeover' { $code = Cmd-Takeover }
                 'fixhost'  { $code = Cmd-Fixhost }
+                'fixmap'   { $code = Cmd-Fixmap }
             }
         }
     } catch {

@@ -39,6 +39,31 @@ import tempfile
 ZERO_UID = "00000000-0000-0000-0000-000000000000"
 DEFAULT_OLD = "00000000000000000000000000000001"
 
+# Player-file fields that carry per-player PROGRESS (transplanted during fix).
+# Identity fields (PlayerUId, IndividualId), container references and
+# platform info deliberately stay with the server-created file.
+PROGRESS_FIELDS = [
+    "TechnologyPoint",
+    "bossTechnologyPoint",
+    "UnlockedRecipeTechnologyNames",
+    "CompletedQuestArray_FullRelease",
+    "OrderedQuestArray_FullRelease",
+    "RecordData",
+    "PlayerCharacterMakeData",
+]
+
+# WorldOption.sav keys owned by server operation / PalRelay provisioning;
+# everything else is a gameplay setting that should follow the world.
+OPTION_EXCLUDE = {
+    "ServerName", "ServerDescription", "AdminPassword", "ServerPassword",
+    "PublicPort", "PublicIP", "RCONEnabled", "RCONPort", "Region", "bUseAuth",
+    "BanListURL", "RESTAPIEnabled", "RESTAPIPort", "bShowPlayerList",
+    "ChatPostLimitPerMinute", "CrossplayPlatforms", "LogFormatType",
+    "bIsUseBackupSaveData", "bAllowClientMod", "CoopPlayerMaxNum",
+    "ServerPlayerMaxNum", "bIsMultiplay", "DenyTechnologyList",
+    "RandomizerType", "RandomizerSeed", "bIsRandomizerPalLevelRandom",
+}
+
 _lib = None
 _REAL_STDOUT = sys.stdout
 
@@ -512,9 +537,22 @@ def cmd_fix(args):
     stats["containersRekeyed"] = containers_rekeyed
     stats["freshContainersDropped"] = dropped
 
+    # --- 5b. progress transplant into the accepted player file --------------
+    # (tech points, recipes, quests, paldeck records incl. fast-travel
+    # unlocks, appearance). Verified live: the server accepts a rewritten
+    # player file as long as identity/containers are untouched.
+    moved_progress = []
+    for f in PROGRESS_FIELDS:
+        if f in old_sd:
+            new_sd[f] = old_sd[f]
+            moved_progress.append(f)
+    stats["progressTransplanted"] = moved_progress
+
     # --- 6. write (conservative: guilds & co. stay byte-identical) ----------
     shutil.copy2(level_path, level_path + ".palfix-bak")
     write_json(level_json, level_path, L["conservative"])
+    shutil.copy2(new_player_path, new_player_path + ".pre-progress-bak")
+    write_json(new_pj, new_player_path)
     os.rename(old_player_path, old_player_path + ".palfix-bak")
 
     # --- 7. verify the identity chain; roll back automatically on failure ---
@@ -522,6 +560,7 @@ def cmd_fix(args):
     stats["verify"] = vreport
     if not ok:
         shutil.copy2(level_path + ".palfix-bak", level_path)
+        shutil.copy2(new_player_path + ".pre-progress-bak", new_player_path)
         os.rename(old_player_path + ".palfix-bak", old_player_path)
         stats["ok"] = False
         stats["rolledBack"] = True
@@ -534,6 +573,43 @@ def cmd_fix(args):
     stats["oldGuid"] = old_d
     stats["newGuid"] = new_d
     emit(stats)
+
+
+def cmd_options(args):
+    """Extract gameplay world settings from WorldOption.sav as ini-ready
+    key/value overrides (server-operational keys excluded)."""
+    src = args.world_option
+    if not os.path.exists(src):
+        fail(f"WorldOption.sav not found: {src}")
+    wo_json, _ = load_json(src)
+    try:
+        settings = wo_json["properties"]["OptionWorldData"]["value"]["Settings"]["value"]
+    except (KeyError, TypeError):
+        fail("OptionWorldData/Settings not found in WorldOption.sav")
+
+    def fmt(val):
+        if isinstance(val, bool):
+            return "True" if val else "False"
+        if isinstance(val, float):
+            return f"{val:.6f}"
+        if isinstance(val, int):
+            return str(val)
+        s = str(val)
+        if "::" in s:
+            return s.split("::")[-1]
+        return None  # strings / complex structures: skip
+
+    flat = {}
+    for k, v in settings.items():
+        if k in OPTION_EXCLUDE:
+            continue
+        val = v.get("value")
+        if isinstance(val, dict) and "value" in val:
+            val = val["value"]
+        f = fmt(val)
+        if f is not None:
+            flat[k] = f
+    emit({"ok": True, "optionOverrides": flat})
 
 
 def main():
@@ -560,6 +636,9 @@ def main():
     p_verify.add_argument("--dir", required=True)
     p_verify.add_argument("--uid", required=True)
 
+    p_opt = sub.add_parser("options")
+    p_opt.add_argument("--world-option", required=True)
+
     args = ap.parse_args()
     setup_ooz(args.ooz_dll)
     sys.stdout = sys.stderr  # keep parser warnings off the JSON channel
@@ -577,6 +656,8 @@ def main():
             emit(vreport)
             if not ok:
                 sys.exit(1)
+        elif args.cmd == "options":
+            cmd_options(args)
     except SystemExit:
         raise
     except Exception as e:
