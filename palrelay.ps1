@@ -1,4 +1,4 @@
-# PalRelay - rotating-host save sync for Palworld dedicated servers.
+﻿# PalRelay - rotating-host save sync for Palworld dedicated servers.
 # Cloud backend: any rclone remote (designed for Google Drive shared folder).
 # Spec: docs/DESIGN.md
 #
@@ -31,7 +31,7 @@ $ErrorActionPreference = 'Stop'
 # non-ASCII world names get mangled on CJK-codepage consoles.
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
 
-$Script:ToolVersion = '0.6.0'
+$Script:ToolVersion = '0.6.1'
 $Script:ToolDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Script:StateFile = Join-Path $Script:ToolDir 'state.json'
 $Script:BackupRoot = Join-Path $Script:ToolDir 'backups'
@@ -735,6 +735,8 @@ function Start-Server {
 }
 
 function Test-ServerAlive($Proc) {
+    # Safety: in test mode never look at (or later kill) real server processes.
+    if ($env:PALRELAY_NO_SERVER -eq '1') { return $false }
     if ($Proc -and -not $Proc.HasExited) { return $true }
     $p = Get-Process -Name 'PalServer*' -ErrorAction SilentlyContinue | Select-Object -First 1
     return ($null -ne $p)
@@ -773,6 +775,18 @@ function Invoke-Checkpoint {
     $newVersion = $Script:SessionVersion + 1
     Publish-Save -SourceDir (Join-Path (Get-SaveRoot) $guid) -WorldGuid $guid -NewVersion $newVersion | Out-Null
     Write-Info ('Checkpoint uploaded as v{0}.' -f $newVersion)
+}
+
+function Set-KeepAwake([bool]$On) {
+    # Block system sleep while hosting (display may still turn off).
+    try {
+        if (-not ('PalRelay.Native' -as [type])) {
+            Add-Type -Namespace PalRelay -Name Native -MemberDefinition `
+                '[DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint esFlags);'
+        }
+        if ($On) { [void][PalRelay.Native]::SetThreadExecutionState(0x80000001) }
+        else { [void][PalRelay.Native]::SetThreadExecutionState(0x80000000) }
+    } catch {}
 }
 
 function Wait-Session($Proc) {
@@ -873,7 +887,8 @@ function Cmd-Start {
         Write-Info 'Press [Q] in this window to stop the server and upload the save.'
         Write-Host ''
 
-        $stopRequested = Wait-Session $proc
+        Set-KeepAwake $true
+        try { $stopRequested = Wait-Session $proc } finally { Set-KeepAwake $false }
         if ($stopRequested) {
             Stop-ServerGraceful $proc | Out-Null
         } else {
@@ -1530,3 +1545,4 @@ function Main {
 if ($env:PALRELAY_TEST -ne '1') {
     Main -Cmd $Command -WorldArg $World
 }
+

@@ -10,6 +10,14 @@ namespace PalRelay.Gui;
 
 public partial class MainWindow : Window
 {
+    // Keep the SYSTEM awake while hosting (display may still sleep).
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    private static extern uint SetThreadExecutionState(uint esFlags);
+    private const uint ES_CONTINUOUS = 0x80000000;
+    private const uint ES_SYSTEM_REQUIRED = 0x00000001;
+    private void KeepAwake(bool on)
+        => SetThreadExecutionState(on ? ES_CONTINUOUS | ES_SYSTEM_REQUIRED : ES_CONTINUOUS);
+
     private bool _hosting;
     private bool _busy;
     private bool _refreshing;
@@ -28,7 +36,7 @@ public partial class MainWindow : Window
         _statusTimer.Tick += async (_, _) => { if (!_hosting && !_busy) await RefreshStatusAsync(); };
         _heartbeatTimer.Tick += async (_, _) => await HeartbeatAsync();
         _watchTimer.Tick += async (_, _) => await WatchServerAsync();
-        ToolVerText.Text = "PalRelay GUI v0.6.0";
+        ToolVerText.Text = "PalRelay GUI v0.6.1";
         Loaded += async (_, _) =>
         {
             Log("PalRelay 已就緒。");
@@ -212,7 +220,9 @@ public partial class MainWindow : Window
             ActionBtn.Background = (Brush)FindResource("BusyBrush");
             _heartbeatTimer.Start();
             _watchTimer.Start();
+            KeepAwake(true);
             Log("伺服器啟動中,朋友稍等一下就能連線。收工時按「收工上傳」。");
+            Log("開服期間已自動防止電腦睡眠(螢幕仍可正常關閉省電)。");
         }
         finally
         {
@@ -233,6 +243,7 @@ public partial class MainWindow : Window
             if (r.Json?["ok"]?.GetValue<bool>() ?? false)
             {
                 _hosting = false;
+                KeepAwake(false);
                 ActionBtn.Content = "開始當主機";
                 ActionBtn.Background = new SolidColorBrush(Color.FromRgb(0x3f, 0xa8, 0x60));
                 Log($"完成!存檔 v{r.Json?["version"]} 已上傳,世界已釋放給下一位。");
@@ -270,6 +281,7 @@ public partial class MainWindow : Window
         else
         {
             _hosting = false;
+            KeepAwake(false);
             _heartbeatTimer.Stop();
             ActionBtn.Content = "開始當主機";
             ActionBtn.Background = new SolidColorBrush(Color.FromRgb(0x3f, 0xa8, 0x60));
