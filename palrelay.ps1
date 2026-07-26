@@ -188,6 +188,11 @@ function Invoke-Rclone {
     if ($code -ne 0 -and -not $AllowFail) {
         $text = ''
         if ($null -ne $out) { $text = (($out | ForEach-Object { $_.ToString() }) -join "`n").Trim() }
+        if ($text -match 'insufficientParentPermissions|Insufficient permissions') {
+            throw ('Your Google account has READ-ONLY access to the shared folder, so hosting cannot write the lock/save. ' +
+                   'Ask the group owner to share the folder with your Google account as an EDITOR ' +
+                   '(link-sharing is view-only). No re-setup needed afterwards - just retry.')
+        }
         throw ('rclone {0} failed (exit {1}): {2}' -f ($Arguments -join ' '), $code, $text)
     }
     return $code
