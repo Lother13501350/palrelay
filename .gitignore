@@ -9,3 +9,6 @@ __pycache__/
 PalRelay.exe
 gui/bin/
 gui/obj/
+
+# Local development and audit hygiene
+.DS_Store
